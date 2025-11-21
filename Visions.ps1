@@ -853,7 +853,26 @@ function Build-RoutingTable {
     }
 
     # Add BGP routes (Admin Distance = 20 for eBGP, 200 for iBGP)
-    # This would require BGP RIB which we don't have from static configs
+    # For WAN connectivity, add default routes learned via BGP
+    if ($Device.BGPNeighbors.Count -gt 0) {
+        foreach ($neighbor in $Device.BGPNeighbors) {
+            if ($neighbor.VRF -eq $VRF -or ($neighbor.VRF -eq "global" -and $VRF -eq "global")) {
+                # Determine admin distance (eBGP = 20, iBGP = 200)
+                $adminDistance = if ($neighbor.RemoteAS -ne $Device.BGP_ASN) { 20 } else { 200 }
+
+                # Add default route via BGP neighbor (common in WAN scenarios)
+                $routingTable += @{
+                    Destination = "0.0.0.0"
+                    Mask = "0.0.0.0"
+                    NextHop = $neighbor.IPAddress
+                    Metric = 0
+                    AdminDistance = $adminDistance
+                    Protocol = "BGP"
+                    ExitInterface = $null  # Will be determined by next hop lookup
+                }
+            }
+        }
+    }
 
     # Add connected routes (Admin Distance = 0)
     foreach ($iface in $Device.Interfaces.Values) {
@@ -1052,7 +1071,10 @@ function Build-NetworkTopology {
     Write-Host "  Building WAN peering connections..." -ForegroundColor Cyan
 
     # Add connections based on BGP peering relationships
+    # Create stub devices for external WAN peers we don't have configs for
     $bgpPeeringCount = 0
+    $externalWANDevices = @()
+
     foreach ($device in $Devices) {
         if ($device.BGPNeighbors.Count -gt 0) {
             foreach ($neighbor in $device.BGPNeighbors) {
@@ -1070,48 +1092,84 @@ function Build-NetworkTopology {
                     if ($peerDevice) { break }
                 }
 
-                if ($peerDevice) {
-                    # Check if connection already exists
-                    $existingConn = $connections | Where-Object {
-                        ($_.Device1.Hostname -eq $device.Hostname -and $_.Device2.Hostname -eq $peerDevice.Hostname) -or
-                        ($_.Device2.Hostname -eq $device.Hostname -and $_.Device1.Hostname -eq $peerDevice.Hostname)
-                    } | Select-Object -First 1
+                if (-not $peerDevice) {
+                    # Create external WAN device stub for this BGP peer
+                    $externalDeviceName = "WAN-Peer-AS$($neighbor.RemoteAS)-$($neighbor.IPAddress -replace '\.', '-')"
 
-                    if (-not $existingConn) {
-                        # Create BGP peering connection
-                        $conn = [Connection]::new($device, $peerDevice)
+                    # Check if we already created this external device
+                    $peerDevice = $Devices | Where-Object { $_.Hostname -eq $externalDeviceName } | Select-Object -First 1
 
-                        # Find interfaces involved
-                        $localIface = $null
+                    if (-not $peerDevice) {
+                        $peerDevice = [NetworkDevice]::new($externalDeviceName)
+                        $peerDevice.DeviceType = "External-WAN"
+                        $peerDevice.BGP_ASN = $neighbor.RemoteAS
+
+                        # Create a virtual interface on the external device
+                        $virtualIface = [NetworkInterface]::new("WAN-Interface")
+                        $virtualIface.IPAddress = $neighbor.IPAddress
+                        # Try to determine subnet from local interface
                         foreach ($iface in $device.Interfaces.Values) {
                             if ($iface.IPAddress -and $iface.Network) {
-                                # Check if neighbor IP is in same subnet
                                 if (Test-SameSubnet -IP1 $iface.IPAddress -Mask1 $iface.SubnetMask -IP2 $neighbor.IPAddress -Mask2 $iface.SubnetMask) {
-                                    $localIface = $iface.Name
+                                    $virtualIface.SubnetMask = $iface.SubnetMask
+                                    $virtualIface.CIDR = $iface.CIDR
+                                    $virtualIface.Network = $iface.Network
+                                    $virtualIface.VRF = $iface.VRF
                                     break
                                 }
                             }
                         }
+                        $peerDevice.Interfaces["WAN-Interface"] = $virtualIface
 
-                        $remoteIface = $null
+                        [void]$Devices.Add($peerDevice)
+                        $externalWANDevices += $externalDeviceName
+                        Write-Host "    Created external WAN device: $externalDeviceName (AS$($neighbor.RemoteAS))" -ForegroundColor DarkCyan
+                    }
+                }
+
+                # Check if connection already exists
+                $existingConn = $connections | Where-Object {
+                    ($_.Device1.Hostname -eq $device.Hostname -and $_.Device2.Hostname -eq $peerDevice.Hostname) -or
+                    ($_.Device2.Hostname -eq $device.Hostname -and $_.Device1.Hostname -eq $peerDevice.Hostname)
+                } | Select-Object -First 1
+
+                if (-not $existingConn) {
+                    # Create BGP peering connection
+                    $conn = [Connection]::new($device, $peerDevice)
+
+                    # Find local interface
+                    $localIface = $null
+                    foreach ($iface in $device.Interfaces.Values) {
+                        if ($iface.IPAddress -and $iface.Network) {
+                            # Check if neighbor IP is in same subnet
+                            if (Test-SameSubnet -IP1 $iface.IPAddress -Mask1 $iface.SubnetMask -IP2 $neighbor.IPAddress -Mask2 $iface.SubnetMask) {
+                                $localIface = $iface.Name
+                                break
+                            }
+                        }
+                    }
+
+                    $remoteIface = "WAN-Interface"
+                    if ($peerDevice.DeviceType -ne "External-WAN") {
                         foreach ($iface in $peerDevice.Interfaces.Values) {
                             if ($iface.IPAddress -eq $neighbor.IPAddress) {
                                 $remoteIface = $iface.Name
                                 break
                             }
                         }
+                    }
 
-                        $conn.Interface1 = if ($localIface) { $localIface } else { "BGP-Peering" }
-                        $conn.Interface2 = if ($remoteIface) { $remoteIface } else { "BGP-Peering" }
-                        $conn.ConnectionType = "BGP-Peering"
-                        $connections += $conn
-                        $bgpPeeringCount++
+                    $conn.Interface1 = if ($localIface) { $localIface } else { "BGP-Peering" }
+                    $conn.Interface2 = $remoteIface
+                    $conn.ConnectionType = "BGP-Peering"
+                    $connections += $conn
+                    $bgpPeeringCount++
 
+                    if ($peerDevice.DeviceType -eq "External-WAN") {
+                        Write-Host "    BGP Peering: $($device.Hostname) (AS$($device.BGP_ASN)) <-> EXTERNAL WAN (AS$($neighbor.RemoteAS))" -ForegroundColor Magenta
+                    } else {
                         Write-Host "    BGP Peering: $($device.Hostname) (AS$($device.BGP_ASN)) <-> $($peerDevice.Hostname) (AS$($neighbor.RemoteAS))" -ForegroundColor Magenta
                     }
-                }
-                else {
-                    Write-Host "    BGP Peer NOT FOUND: $($device.Hostname) neighbor $($neighbor.IPAddress) (AS$($neighbor.RemoteAS))" -ForegroundColor DarkYellow
                 }
             }
         }
@@ -1181,8 +1239,12 @@ function Build-NetworkTopology {
     Write-Host "    Connected subnets: $connectedSubnets" -ForegroundColor Green
     Write-Host "    BGP peerings: $bgpPeeringCount" -ForegroundColor Magenta
     Write-Host "    OSPF adjacencies: $ospfAdjacencyCount" -ForegroundColor Cyan
+    if ($externalWANDevices.Count -gt 0) {
+        Write-Host "    External WAN devices created: $($externalWANDevices.Count)" -ForegroundColor DarkCyan
+    }
     Write-Host "    Isolated interfaces: $isolatedCount" -ForegroundColor Yellow
     Write-Host "    Total connections created: $($connections.Count)" -ForegroundColor Green
+    Write-Host "    Total devices (including external WAN): $($Devices.Count)" -ForegroundColor Gray
 
     return $connections
 }
