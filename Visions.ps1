@@ -538,11 +538,11 @@ function Parse-CiscoConfig {
         # Parse OSPF process
         $m = $rxOSPFProcess.Match($line)
         if ($m.Success) {
-            $processID = [int]$m.Groups[1].Value
+            $ospfProcessNum = [int]$m.Groups[1].Value
             $vrfName = if ($m.Groups[2].Success) { $m.Groups[2].Value } else { "global" }
-            $currentOSPF = [OSPFProcess]::new($processID)
+            $currentOSPF = [OSPFProcess]::new($ospfProcessNum)
             $currentOSPF.VRF = $vrfName
-            $device.OSPFProcesses[$processID] = $currentOSPF
+            $device.OSPFProcesses[$ospfProcessNum] = $currentOSPF
             $device.DeviceType = "Router"
             $currentInterface = $null
             continue
