@@ -1018,18 +1018,18 @@ function Find-Path {
         [System.Collections.ArrayList]$AllDevices,
         [array]$Connections
     )
-    
+
     # Simple BFS path finding
     $queue = New-Object System.Collections.Queue
     $visited = @{}
     $parent = @{}
-    
+
     $queue.Enqueue($Source.Hostname)
     $visited[$Source.Hostname] = $true
-    
+
     while ($queue.Count -gt 0) {
         $current = $queue.Dequeue()
-        
+
         if ($current -eq $Destination.Hostname) {
             # Reconstruct path
             $path = @()
@@ -1040,19 +1040,19 @@ function Find-Path {
             }
             return $path
         }
-        
+
         # Find neighbors
         $neighbors = $Connections | Where-Object {
             $_.Device1.Hostname -eq $current -or $_.Device2.Hostname -eq $current
         }
-        
+
         foreach ($conn in $neighbors) {
             $neighbor = if ($conn.Device1.Hostname -eq $current) {
                 $conn.Device2.Hostname
             } else {
                 $conn.Device1.Hostname
             }
-            
+
             if (-not $visited[$neighbor]) {
                 $visited[$neighbor] = $true
                 $parent[$neighbor] = $current
@@ -1060,8 +1060,160 @@ function Find-Path {
             }
         }
     }
-    
+
     return @() # No path found
+}
+
+function Find-RoutingPath {
+    param(
+        [NetworkDevice]$Source,
+        [string]$SourceIP,
+        [string]$DestIP,
+        [System.Collections.ArrayList]$AllDevices,
+        [array]$Connections,
+        [int]$MaxHops = 30
+    )
+
+    <#
+    .SYNOPSIS
+    Finds path based on ROUTING TABLES, not just connectivity.
+    Shows which interface traffic exits based on destination IP.
+
+    .DESCRIPTION
+    This simulates actual packet forwarding:
+    1. Start at source device
+    2. Look up destination in routing table
+    3. Find next hop
+    4. Determine which interface reaches next hop
+    5. Move to next hop device
+    6. Repeat until destination reached or loop detected
+    #>
+
+    $path = @()
+    $currentDevice = $Source
+    $currentIP = $SourceIP
+    $hopCount = 0
+    $visitedDevices = @{}
+
+    while ($hopCount -lt $MaxHops) {
+        $hopCount++
+
+        # Add current device to path
+        $pathHop = @{
+            Device = $currentDevice
+            HopNumber = $hopCount
+        }
+
+        # Check if we've reached destination device
+        $destinationReached = $false
+        foreach ($iface in $currentDevice.Interfaces.Values) {
+            if ($iface.IPAddress -eq $DestIP -or
+                (Test-SameSubnet -IP1 $iface.IPAddress -Mask1 $iface.SubnetMask -IP2 $DestIP -Mask2 $iface.SubnetMask)) {
+                $destinationReached = $true
+                $pathHop.ExitInterface = $iface.Name
+                $pathHop.ExitIP = $iface.IPAddress
+                $pathHop.Reason = "Destination $DestIP is directly connected on this interface"
+                break
+            }
+        }
+
+        if ($destinationReached) {
+            $path += $pathHop
+            break
+        }
+
+        # Build routing table for current device
+        # Need to determine VRF - use first interface's VRF or global
+        $deviceVRF = "global"
+        if ($currentDevice.Interfaces.Count -gt 0) {
+            $firstIface = $currentDevice.Interfaces.Values | Select-Object -First 1
+            if ($firstIface.VRF) {
+                $deviceVRF = $firstIface.VRF
+            }
+        }
+
+        $routingTable = Build-RoutingTable -Device $currentDevice -VRF $deviceVRF
+        $bestRoute = Find-BestRoute -RoutingTable $routingTable -DestIP $DestIP
+
+        if (-not $bestRoute) {
+            $pathHop.Reason = "No route to destination $DestIP"
+            $pathHop.Error = $true
+            $path += $pathHop
+            break
+        }
+
+        # Determine exit interface based on routing decision
+        $exitInterface = $null
+        $nextHopIP = $bestRoute.NextHop
+
+        if ($bestRoute.Protocol -eq "Connected") {
+            # Directly connected - use the interface from routing table
+            $exitInterface = $currentDevice.Interfaces[$bestRoute.ExitInterface]
+            $pathHop.Reason = "Destination is on connected subnet $($bestRoute.Destination)/$($bestRoute.Mask)"
+        }
+        else {
+            # Need to find which interface can reach next hop
+            foreach ($iface in $currentDevice.Interfaces.Values) {
+                if ($iface.IPAddress -and $iface.SubnetMask) {
+                    # Check if next hop is in this interface's subnet
+                    if (Test-SameSubnet -IP1 $iface.IPAddress -Mask1 $iface.SubnetMask -IP2 $nextHopIP -Mask2 $iface.SubnetMask) {
+                        $exitInterface = $iface
+                        $pathHop.Reason = "Route to $($bestRoute.Destination)/$($ConvertTo-CIDR -SubnetMask $bestRoute.Mask) via $nextHopIP [Protocol: $($bestRoute.Protocol), AD: $($bestRoute.AdminDistance), Metric: $($bestRoute.Metric)]"
+                        break
+                    }
+                }
+            }
+        }
+
+        if (-not $exitInterface) {
+            $pathHop.Reason = "Cannot find interface to reach next hop $nextHopIP"
+            $pathHop.Error = $true
+            $path += $pathHop
+            break
+        }
+
+        $pathHop.ExitInterface = $exitInterface.Name
+        $pathHop.ExitIP = $exitInterface.IPAddress
+        $pathHop.ExitVRF = $exitInterface.VRF
+        $pathHop.NextHop = $nextHopIP
+        $path += $pathHop
+
+        # Find next device via connection
+        $nextDevice = $null
+        foreach ($conn in $Connections) {
+            if ($conn.Device1.Hostname -eq $currentDevice.Hostname -and $conn.Interface1 -eq $exitInterface.Name) {
+                $nextDevice = $conn.Device2
+                break
+            }
+            elseif ($conn.Device2.Hostname -eq $currentDevice.Hostname -and $conn.Interface2 -eq $exitInterface.Name) {
+                $nextDevice = $conn.Device1
+                break
+            }
+        }
+
+        if (-not $nextDevice) {
+            $pathHop.Reason += " | No connected device found on this interface"
+            $pathHop.Error = $true
+            break
+        }
+
+        # Loop detection
+        if ($visitedDevices.ContainsKey($nextDevice.Hostname)) {
+            $pathHop.Reason += " | ROUTING LOOP DETECTED"
+            $pathHop.Error = $true
+            break
+        }
+
+        $visitedDevices[$nextDevice.Hostname] = $true
+        $currentDevice = $nextDevice
+    }
+
+    if ($hopCount -ge $MaxHops) {
+        $path[-1].Reason += " | Maximum hop count reached"
+        $path[-1].Error = $true
+    }
+
+    return $path
 }
 
 function Get-ComprehensivePathAnalysis {
@@ -1181,13 +1333,24 @@ function Show-NetworkMap {
         </Grid.RowDefinitions>
         
         <!-- Toolbar -->
-        <StackPanel Grid.Row="0" Orientation="Horizontal" Background="#F0F0F0" Margin="5">
-            <Label Content="Source:" VerticalAlignment="Center"/>
-            <ComboBox Name="SourceCombo" Width="150" Margin="5"/>
-            <Label Content="Destination:" VerticalAlignment="Center" Margin="10,0,0,0"/>
-            <ComboBox Name="DestCombo" Width="150" Margin="5"/>
-            <Button Name="TraceButton" Content="Trace Path" Width="100" Margin="10,5,5,5" Padding="5"/>
-            <Button Name="ClearButton" Content="Clear" Width="80" Margin="5" Padding="5"/>
+        <StackPanel Grid.Row="0" Background="#F0F0F0" Margin="5">
+            <!-- First row: Device selection -->
+            <StackPanel Orientation="Horizontal" Margin="0,5,0,5">
+                <Label Content="Source Device:" VerticalAlignment="Center" Width="100"/>
+                <ComboBox Name="SourceCombo" Width="150" Margin="5,0,0,0"/>
+                <Label Content="Destination Device:" VerticalAlignment="Center" Margin="20,0,0,0" Width="130"/>
+                <ComboBox Name="DestCombo" Width="150" Margin="5,0,0,0"/>
+                <Button Name="TraceButton" Content="Trace Path" Width="100" Margin="20,0,5,0" Padding="5"/>
+                <Button Name="ClearButton" Content="Clear" Width="80" Margin="5,0,0,0" Padding="5"/>
+            </StackPanel>
+            <!-- Second row: IP specification -->
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,5">
+                <Label Content="Source IP:" VerticalAlignment="Center" Width="100"/>
+                <TextBox Name="SourceIPBox" Width="120" Margin="5,0,0,0" Text="10.10.10.100" VerticalContentAlignment="Center"/>
+                <Label Content="Destination IP:" VerticalAlignment="Center" Margin="20,0,0,0" Width="130"/>
+                <TextBox Name="DestIPBox" Width="120" Margin="5,0,0,0" Text="10.20.20.100" VerticalContentAlignment="Center"/>
+                <CheckBox Name="UseRoutingCheckBox" Content="Use Routing Tables" VerticalAlignment="Center" Margin="20,0,0,0" IsChecked="True"/>
+            </StackPanel>
         </StackPanel>
         
         <!-- Canvas for network diagram -->
@@ -1226,6 +1389,9 @@ function Show-NetworkMap {
     $canvas = $window.FindName("NetworkCanvas")
     $sourceCombo = $window.FindName("SourceCombo")
     $destCombo = $window.FindName("DestCombo")
+    $sourceIPBox = $window.FindName("SourceIPBox")
+    $destIPBox = $window.FindName("DestIPBox")
+    $useRoutingCheckBox = $window.FindName("UseRoutingCheckBox")
     $traceButton = $window.FindName("TraceButton")
     $clearButton = $window.FindName("ClearButton")
     $detailsBox = $window.FindName("DetailsBox")
@@ -1347,110 +1513,274 @@ function Show-NetworkMap {
             return
         }
 
-        $srcDevice = $Devices | Where-Object { $_.Hostname -eq $sourceCombo.SelectedItem }
-        $dstDevice = $Devices | Where-Object { $_.Hostname -eq $destCombo.SelectedItem }
+        # Get user inputs
+        $sourceIP = $sourceIPBox.Text.Trim()
+        $destIP = $destIPBox.Text.Trim()
+        $useRouting = $useRoutingCheckBox.IsChecked
 
-        $path = Find-Path -Source $srcDevice -Destination $dstDevice -AllDevices $Devices -Connections $Connections
-
-        if ($path.Count -eq 0) {
-            $detailsBox.Text = "No path found between $($srcDevice.Hostname) and $($dstDevice.Hostname)"
-            Clear-Highlights
+        # Validate IP addresses
+        if (-not (Test-ValidIPAddress -IP $sourceIP)) {
+            [System.Windows.MessageBox]::Show("Invalid source IP address: $sourceIP`n`nPlease enter a valid IP address (e.g., 10.10.10.100)", "Validation Error")
             return
         }
 
-        # Clear previous highlights (efficient - no full redraw)
+        if (-not (Test-ValidIPAddress -IP $destIP)) {
+            [System.Windows.MessageBox]::Show("Invalid destination IP address: $destIP`n`nPlease enter a valid IP address (e.g., 10.20.20.100)", "Validation Error")
+            return
+        }
+
+        $srcDevice = $Devices | Where-Object { $_.Hostname -eq $sourceCombo.SelectedItem }
+        $dstDevice = $Devices | Where-Object { $_.Hostname -eq $destCombo.SelectedItem }
+
+        # Clear previous highlights
         Clear-Highlights
 
-        # Highlight connections in path (update existing elements + add overlays)
-        for ($i = 0; $i -lt $path.Count - 1; $i++) {
-            $dev1Name = $path[$i]
-            $dev2Name = $path[$i + 1]
+        # Use routing-aware or connectivity-based path finding
+        if ($useRouting) {
+            # ROUTING-AWARE PATH FINDING - simulates actual packet forwarding
+            $routingPath = Find-RoutingPath -Source $srcDevice -SourceIP $sourceIP -DestIP $destIP -AllDevices $Devices -Connections $Connections
 
-            $conn = $Connections | Where-Object {
-                ($_.Device1.Hostname -eq $dev1Name -and $_.Device2.Hostname -eq $dev2Name) -or
-                ($_.Device2.Hostname -eq $dev1Name -and $_.Device1.Hostname -eq $dev2Name)
-            } | Select-Object -First 1
-
-            if ($conn) {
-                # Create highlight overlay line
-                $line = New-Object System.Windows.Shapes.Line
-                $line.X1 = $conn.Device1.X
-                $line.Y1 = $conn.Device1.Y
-                $line.X2 = $conn.Device2.X
-                $line.Y2 = $conn.Device2.Y
-                $line.Stroke = [System.Windows.Media.Brushes]::Green
-                $line.StrokeThickness = 4
-                [void]$canvas.Children.Add($line)
-                $script:highlightElements += $line
+            if ($routingPath.Count -eq 0 -or $routingPath[0].Error) {
+                $errorMsg = if ($routingPath.Count -gt 0) { $routingPath[0].Error } else { "No routing path found" }
+                $detailsBox.Text = "ROUTING-AWARE PATH TRACE FAILED`n" +
+                                   "Source: $($srcDevice.Hostname) ($sourceIP)`n" +
+                                   "Destination: $destIP`n" +
+                                   "=" * 80 + "`n`n" +
+                                   "ERROR: $errorMsg"
+                return
             }
-        }
 
-        # Highlight devices in path (update existing elements + add overlays)
-        foreach ($deviceName in $path) {
-            $device = $Devices | Where-Object { $_.Hostname -eq $deviceName }
+            # Extract device names for highlighting
+            $path = @($routingPath | ForEach-Object { $_.Device.Hostname })
 
-            # Update existing device element colors
-            if ($script:deviceElements.ContainsKey($deviceName)) {
-                $script:deviceElements[$deviceName].Ellipse.Fill = [System.Windows.Media.Brushes]::LightGreen
-                $script:deviceElements[$deviceName].Ellipse.Stroke = [System.Windows.Media.Brushes]::DarkGreen
-                $script:deviceElements[$deviceName].Ellipse.StrokeThickness = 3
-            }
-        }
+            # Highlight connections in path
+            for ($i = 0; $i -lt $path.Count - 1; $i++) {
+                $dev1Name = $path[$i]
+                $dev2Name = $path[$i + 1]
 
-        # Get comprehensive path analysis
-        $comprehensiveAnalysis = Get-ComprehensivePathAnalysis -Path $path -AllDevices $Devices -Connections $Connections
+                $conn = $Connections | Where-Object {
+                    ($_.Device1.Hostname -eq $dev1Name -and $_.Device2.Hostname -eq $dev2Name) -or
+                    ($_.Device2.Hostname -eq $dev1Name -and $_.Device1.Hostname -eq $dev2Name)
+                } | Select-Object -First 1
 
-        # Display comprehensive path details
-        $details = "COMPREHENSIVE PATH ANALYSIS`n"
-        $details += "Path from $($srcDevice.Hostname) to $($dstDevice.Hostname):`n"
-        $details += "=" * 80 + "`n`n"
-
-        $pathBlocked = $false
-
-        foreach ($hop in $comprehensiveAnalysis) {
-            $details += "Hop $($hop.HopNumber): $($hop.DeviceName) ($($hop.DeviceType))`n"
-
-            if ($hop.ExitInterface) {
-                $details += "  Exit Interface: $($hop.ExitInterface) ($($hop.ExitIP))"
-                if ($hop.VRF -ne "global") {
-                    $details += " [VRF: $($hop.VRF)]"
+                if ($conn) {
+                    $line = New-Object System.Windows.Shapes.Line
+                    $line.X1 = $conn.Device1.X
+                    $line.Y1 = $conn.Device1.Y
+                    $line.X2 = $conn.Device2.X
+                    $line.Y2 = $conn.Device2.Y
+                    $line.Stroke = [System.Windows.Media.Brushes]::Green
+                    $line.StrokeThickness = 4
+                    [void]$canvas.Children.Add($line)
+                    $script:highlightElements += $line
                 }
+            }
+
+            # Highlight devices in path
+            foreach ($deviceName in $path) {
+                if ($script:deviceElements.ContainsKey($deviceName)) {
+                    $script:deviceElements[$deviceName].Ellipse.Fill = [System.Windows.Media.Brushes]::LightGreen
+                    $script:deviceElements[$deviceName].Ellipse.Stroke = [System.Windows.Media.Brushes]::DarkGreen
+                    $script:deviceElements[$deviceName].Ellipse.StrokeThickness = 3
+                }
+            }
+
+            # Display routing-aware path details
+            $details = "ROUTING-AWARE PATH TRACE`n"
+            $details += "Source: $($srcDevice.Hostname) ($sourceIP)`n"
+            $details += "Destination: $destIP`n"
+            $details += "=" * 80 + "`n`n"
+
+            $currentIP = $sourceIP
+            foreach ($hop in $routingPath) {
+                $details += "Hop $($hop.HopNumber): $($hop.Device.Hostname) ($($hop.Device.Type))`n"
+                $details += "  Current Source IP: $currentIP`n"
+
+                if ($hop.ExitInterface) {
+                    $details += "  Exit Interface: $($hop.ExitInterface) ($($hop.ExitIP))"
+                    if ($hop.VRF -ne "global") {
+                        $details += " [VRF: $($hop.VRF)]"
+                    }
+                    $details += "`n"
+                    $details += "  [Routing] $($hop.Reason)`n"
+
+                    if ($hop.NextHop) {
+                        $details += "  Next Hop: $($hop.NextHop)`n"
+                    }
+
+                    # Run comprehensive analysis for this hop
+                    $device = $hop.Device
+                    $outInterface = $device.Interfaces | Where-Object { $_.Name -eq $hop.ExitInterface } | Select-Object -First 1
+
+                    # Check for NAT translation
+                    if ($outInterface -and $outInterface.NATOutside) {
+                        $natResult = Apply-NATTranslation -Device $device -SourceIP $currentIP -Interface $hop.ExitInterface
+                        if ($natResult.Translated) {
+                            $details += "  [NAT] $currentIP -> $($natResult.NewIP) ($($natResult.Type))`n"
+                            $currentIP = $natResult.NewIP
+                        }
+                    }
+
+                    # Check for ACL
+                    if ($outInterface -and $outInterface.ACL_Out) {
+                        $acl = $device.ACLs[$outInterface.ACL_Out]
+                        if ($acl) {
+                            $aclResult = Test-ACLMatch -ACL $acl -SourceIP $currentIP -DestIP $destIP
+                            if ($aclResult.Action -eq "deny") {
+                                $details += "  [ACL-DENY] Outbound ACL ($($acl.Name)): DENIED - $($aclResult.Reason)`n"
+                                $details += "`n  *** PATH BLOCKED AT THIS HOP ***`n"
+                                $details += "`n" + "=" * 80 + "`n"
+                                $details += "RESULT: Traffic DENIED - path blocked by ACL/firewall`n"
+                                $detailsBox.Text = $details
+                                return
+                            } else {
+                                $details += "  [ACL-PERMIT] Outbound ACL ($($acl.Name)): PERMITTED`n"
+                            }
+                        }
+                    }
+
+                    # Check for QoS
+                    if ($outInterface -and $outInterface.ServicePolicy_Out) {
+                        $qosResult = Get-QoSMarking -Device $device -PolicyMapName $outInterface.ServicePolicy_Out
+                        if ($qosResult.Applied) {
+                            $details += "  [QoS] Policy $($qosResult.PolicyMap) applied`n"
+                        }
+                    }
+
+                    # Display BGP info
+                    if ($device.BGP_ASN) {
+                        $neighborCount = ($device.BGPNeighbors | Where-Object { $_.VRF -eq $hop.VRF }).Count
+                        if ($neighborCount -gt 0) {
+                            $details += "  [BGP] AS$($device.BGP_ASN) configured ($neighborCount neighbors)`n"
+                        }
+                    }
+
+                    # Display OSPF info
+                    if ($device.OSPFProcesses.Count -gt 0) {
+                        $ospfProcs = ($device.OSPFProcesses.Values | Where-Object { $_.VRF -eq $hop.VRF -or ($_.VRF -eq "global" -and $hop.VRF -eq "global") })
+                        if ($ospfProcs.Count -gt 0) {
+                            $procIDs = ($ospfProcs | ForEach-Object { $_.ProcessID }) -join ", "
+                            $details += "  [OSPF] Process(es): $procIDs`n"
+                        }
+                    }
+                }
+
+                if ($hop.Error) {
+                    $details += "  ERROR: $($hop.Error)`n"
+                    $details += "`n  *** PATH CANNOT CONTINUE ***`n"
+                    $details += "`n" + "=" * 80 + "`n"
+                    $details += "RESULT: Path FAILED - $($hop.Error)`n"
+                    $detailsBox.Text = $details
+                    return
+                }
+
                 $details += "`n"
             }
 
-            # Display all analysis results
-            foreach ($analysisLine in $hop.Analysis) {
-                $details += "  $analysisLine`n"
-            }
-
-            if ($hop.Blocked) {
-                $details += "`n  *** PATH BLOCKED AT THIS HOP ***`n"
-                $pathBlocked = $true
-                break
-            }
-
-            $details += "`n"
-        }
-
-        if ($pathBlocked) {
-            $details += "`n" + "=" * 80 + "`n"
-            $details += "RESULT: Traffic DENIED - path blocked by ACL/firewall`n"
-        } else {
             $details += "=" * 80 + "`n"
             $details += "RESULT: Path is VALID - traffic would be forwarded successfully`n"
+            $details += "`nPATH STATISTICS:`n"
+            $details += "  Total Hops: $($routingPath.Count)`n"
+            $details += "  Routing Decision: Based on routing tables (longest prefix match)`n"
+
+            $detailsBox.Text = $details
+
+        } else {
+            # CONNECTIVITY-BASED PATH FINDING - original BFS algorithm
+            $path = Find-Path -Source $srcDevice -Destination $dstDevice -AllDevices $Devices -Connections $Connections
+
+            if ($path.Count -eq 0) {
+                $detailsBox.Text = "No path found between $($srcDevice.Hostname) and $($dstDevice.Hostname)"
+                return
+            }
+
+            # Highlight connections in path
+            for ($i = 0; $i -lt $path.Count - 1; $i++) {
+                $dev1Name = $path[$i]
+                $dev2Name = $path[$i + 1]
+
+                $conn = $Connections | Where-Object {
+                    ($_.Device1.Hostname -eq $dev1Name -and $_.Device2.Hostname -eq $dev2Name) -or
+                    ($_.Device2.Hostname -eq $dev1Name -and $_.Device1.Hostname -eq $dev2Name)
+                } | Select-Object -First 1
+
+                if ($conn) {
+                    $line = New-Object System.Windows.Shapes.Line
+                    $line.X1 = $conn.Device1.X
+                    $line.Y1 = $conn.Device1.Y
+                    $line.X2 = $conn.Device2.X
+                    $line.Y2 = $conn.Device2.Y
+                    $line.Stroke = [System.Windows.Media.Brushes]::Green
+                    $line.StrokeThickness = 4
+                    [void]$canvas.Children.Add($line)
+                    $script:highlightElements += $line
+                }
+            }
+
+            # Highlight devices in path
+            foreach ($deviceName in $path) {
+                if ($script:deviceElements.ContainsKey($deviceName)) {
+                    $script:deviceElements[$deviceName].Ellipse.Fill = [System.Windows.Media.Brushes]::LightGreen
+                    $script:deviceElements[$deviceName].Ellipse.Stroke = [System.Windows.Media.Brushes]::DarkGreen
+                    $script:deviceElements[$deviceName].Ellipse.StrokeThickness = 3
+                }
+            }
+
+            # Get comprehensive path analysis
+            $comprehensiveAnalysis = Get-ComprehensivePathAnalysis -Path $path -AllDevices $Devices -Connections $Connections
+
+            # Display comprehensive path details
+            $details = "COMPREHENSIVE PATH ANALYSIS`n"
+            $details += "Path from $($srcDevice.Hostname) to $($dstDevice.Hostname):`n"
+            $details += "=" * 80 + "`n`n"
+
+            $pathBlocked = $false
+
+            foreach ($hop in $comprehensiveAnalysis) {
+                $details += "Hop $($hop.HopNumber): $($hop.DeviceName) ($($hop.DeviceType))`n"
+
+                if ($hop.ExitInterface) {
+                    $details += "  Exit Interface: $($hop.ExitInterface) ($($hop.ExitIP))"
+                    if ($hop.VRF -ne "global") {
+                        $details += " [VRF: $($hop.VRF)]"
+                    }
+                    $details += "`n"
+                }
+
+                # Display all analysis results
+                foreach ($analysisLine in $hop.Analysis) {
+                    $details += "  $analysisLine`n"
+                }
+
+                if ($hop.Blocked) {
+                    $details += "`n  *** PATH BLOCKED AT THIS HOP ***`n"
+                    $pathBlocked = $true
+                    break
+                }
+
+                $details += "`n"
+            }
+
+            if ($pathBlocked) {
+                $details += "`n" + "=" * 80 + "`n"
+                $details += "RESULT: Traffic DENIED - path blocked by ACL/firewall`n"
+            } else {
+                $details += "=" * 80 + "`n"
+                $details += "RESULT: Path is VALID - traffic would be forwarded successfully`n"
+            }
+
+            # Add summary statistics
+            $details += "`nPATH STATISTICS:`n"
+            $details += "  Total Hops: $($path.Count)`n"
+            $aclCount = ($comprehensiveAnalysis | Where-Object { $_.Analysis -match "ACL" }).Count
+            $natCount = ($comprehensiveAnalysis | Where-Object { $_.Analysis -match "NAT" }).Count
+            $qosCount = ($comprehensiveAnalysis | Where-Object { $_.Analysis -match "QoS" }).Count
+            if ($aclCount -gt 0) { $details += "  ACL Checks: $aclCount`n" }
+            if ($natCount -gt 0) { $details += "  NAT Translations: $natCount`n" }
+            if ($qosCount -gt 0) { $details += "  QoS Policies: $qosCount`n" }
+
+            $detailsBox.Text = $details
         }
-
-        # Add summary statistics
-        $details += "`nPATH STATISTICS:`n"
-        $details += "  Total Hops: $($path.Count)`n"
-        $aclCount = ($comprehensiveAnalysis | Where-Object { $_.Analysis -match "ACL" }).Count
-        $natCount = ($comprehensiveAnalysis | Where-Object { $_.Analysis -match "NAT" }).Count
-        $qosCount = ($comprehensiveAnalysis | Where-Object { $_.Analysis -match "QoS" }).Count
-        if ($aclCount -gt 0) { $details += "  ACL Checks: $aclCount`n" }
-        if ($natCount -gt 0) { $details += "  NAT Translations: $natCount`n" }
-        if ($qosCount -gt 0) { $details += "  QoS Policies: $qosCount`n" }
-
-        $detailsBox.Text = $details
     })
     
     # Clear button handler
