@@ -276,17 +276,20 @@ function Parse-CiscoConfig {
             $currentInterface.VRF = $currentVRF  # Inherit current VRF context
             $device.Interfaces[$ifaceName] = $currentInterface
 
-            # Determine device type from interfaces
+            # Determine device type from interfaces (tentative - may be overridden later)
             if ($ifaceName -match '^(TenGigabitEthernet|GigabitEthernet|FastEthernet|Ethernet)') {
                 if ($device.DeviceType -eq "Unknown") {
-                    $device.DeviceType = "Router"
+                    $device.DeviceType = "Router"  # Tentative
                 }
             }
             if ($ifaceName -match '^Vlan') {
-                $device.DeviceType = "Switch"
+                # Could be L3 switch - don't override if already Router
+                if ($device.DeviceType -eq "Unknown") {
+                    $device.DeviceType = "Switch"
+                }
             }
             if ($rxTunnelInterface.IsMatch($ifaceName)) {
-                $device.DeviceType = "Router"
+                $device.DeviceType = "Router"  # Tunnel = definitely router
             }
             continue
         }
@@ -585,6 +588,57 @@ function Parse-CiscoConfig {
         $device.Hostname = [System.IO.Path]::GetFileNameWithoutExtension($Filename)
     }
 
+    # Final device type determination based on routing capabilities
+    # This overrides tentative interface-based detection
+    $routingScore = 0
+
+    # Check for routing protocols
+    if ($device.BGP_ASN -gt 0) { $routingScore += 10 }  # BGP = strong indicator
+    if ($device.OSPFProcesses.Count -gt 0) { $routingScore += 10 }  # OSPF = strong indicator
+
+    # Check for multiple VRFs (VRF-aware routing)
+    $vrfCount = 0
+    $vrfs = @{}
+    foreach ($iface in $device.Interfaces.Values) {
+        if ($iface.VRF -and $iface.VRF -ne "global") {
+            $vrfs[$iface.VRF] = $true
+        }
+    }
+    $vrfCount = $vrfs.Count
+    if ($vrfCount -ge 1) { $routingScore += 5 }  # VRFs = routing feature
+    if ($vrfCount -ge 3) { $routingScore += 5 }  # Many VRFs = enterprise router
+
+    # Check for static routes (basic routing)
+    if ($device.Routes.Count -gt 0) { $routingScore += 3 }
+
+    # Check for tunnel interfaces (VPN/MPLS)
+    $hasTunnels = $false
+    foreach ($iface in $device.Interfaces.Values) {
+        if ($iface.Name -match '^Tunnel') {
+            $hasTunnels = $true
+            break
+        }
+    }
+    if ($hasTunnels) { $routingScore += 5 }
+
+    # Check for NAT (router feature)
+    if ($device.NATRules.Count -gt 0) { $routingScore += 3 }
+
+    # Check for ACLs (common on routers)
+    if ($device.ACLs.Count -gt 0) { $routingScore += 1 }
+
+    # Determine final device type based on routing score
+    # Score >= 10: Definitely a router (has routing protocols)
+    # Score >= 5: Likely a router (has routing features)
+    # Score < 5: Keep interface-based detection
+    if ($routingScore >= 10) {
+        $device.DeviceType = "Router"
+    }
+    elseif ($routingScore >= 5 -and $device.DeviceType -eq "Switch") {
+        # L3 switch with significant routing - call it a router
+        $device.DeviceType = "Router"
+    }
+
     return $device
 }
 
@@ -856,10 +910,15 @@ function Build-NetworkTopology {
     # Key format: "VRF:Network/CIDR" e.g., "global:10.10.10.0/24" or "CORP:10.10.10.0/24"
     $subnetMap = @{}
 
+    Write-Host "  Building topology from interface subnets..." -ForegroundColor Cyan
+
     foreach ($device in $Devices) {
+        $deviceHasConnections = $false
         foreach ($iface in $device.Interfaces.Values) {
             # Skip interfaces without IP addresses
-            if (-not $iface.IPAddress -or -not $iface.Network) { continue }
+            if (-not $iface.IPAddress -or -not $iface.Network) {
+                continue
+            }
 
             # Create unique key with VRF and network
             $key = "$($iface.VRF):$($iface.Network)/$($iface.CIDR)"
@@ -873,6 +932,12 @@ function Build-NetworkTopology {
                 Device = $device
                 Interface = $iface
             }
+            $deviceHasConnections = $true
+        }
+
+        # Warn if device has no routable interfaces
+        if (-not $deviceHasConnections -and $device.Interfaces.Count -gt 0) {
+            Write-Host "    WARNING: $($device.Hostname) has $($device.Interfaces.Count) interface(s) but none have valid IP/subnet" -ForegroundColor Yellow
         }
     }
 
@@ -880,8 +945,14 @@ function Build-NetworkTopology {
     foreach ($key in $subnetMap.Keys) {
         $members = $subnetMap[$key]
 
-        # Need at least 2 devices in same subnet to create connection
-        if ($members.Count -lt 2) { continue }
+        # Warn about isolated subnets
+        if ($members.Count -eq 1) {
+            $isolatedDevice = $members[0].Device.Hostname
+            $isolatedIface = $members[0].Interface.Name
+            $isolatedIP = $members[0].Interface.IPAddress
+            Write-Host "    INFO: $isolatedDevice $isolatedIface ($isolatedIP) is alone in subnet $key" -ForegroundColor Gray
+            continue
+        }
 
         # Create connections between all pairs in this subnet
         for ($i = 0; $i -lt $members.Count; $i++) {
