@@ -81,9 +81,12 @@ class NetworkDevice {
     [hashtable]$QoSClassMaps = @{}  # Name -> QoSClassMap
     [hashtable]$QoSPolicyMaps = @{}  # Name -> QoSPolicyMap
     [System.Collections.ArrayList]$BGPNeighbors = @()
+    [hashtable]$BGPNetworks = @{}  # Network/CIDR -> VRF (BGP originated routes)
     [hashtable]$OSPFProcesses = @{}  # ProcessID -> OSPFProcess
     [int]$BGP_ASN = 0
     [string]$BGP_RouterID
+    [bool]$BGPRedistributeConnected = $false
+    [bool]$BGPRedistributeStatic = $false
 
     NetworkDevice([string]$hostname) {
         $this.Hostname = $hostname
@@ -239,6 +242,8 @@ function Parse-CiscoConfig {
     $rxBGP = [regex]'^router bgp\s+(\d+)'
     $rxBGPRouterID = [regex]'^\s*bgp router-id\s+(\d+\.\d+\.\d+\.\d+)'
     $rxBGPNeighbor = [regex]'^\s*neighbor\s+(\d+\.\d+\.\d+\.\d+)\s+remote-as\s+(\d+)'
+    $rxBGPNetwork = [regex]'^\s*network\s+(\d+\.\d+\.\d+\.\d+)(?:\s+mask\s+(\d+\.\d+\.\d+\.\d+))?'
+    $rxBGPRedistribute = [regex]'^\s*redistribute\s+(connected|static|ospf|rip)'
 
     # OSPF patterns
     $rxOSPFProcess = [regex]'^router ospf\s+(\d+)(?:\s+vrf\s+(\S+))?'
@@ -534,6 +539,38 @@ function Parse-CiscoConfig {
             }
         }
 
+        # Parse BGP network statements
+        if ($currentBGP) {
+            $m = $rxBGPNetwork.Match($line)
+            if ($m.Success) {
+                $networkIP = $m.Groups[1].Value
+                $networkMask = if ($m.Groups[2].Success) { $m.Groups[2].Value } else { "255.255.255.0" }  # Default Class C if no mask
+
+                # Calculate network address and CIDR
+                $networkAddr = Get-NetworkAddress -IP $networkIP -Mask $networkMask
+                $cidr = ConvertTo-CIDR -SubnetMask $networkMask
+                $networkKey = "$networkAddr/$cidr"
+
+                $device.BGPNetworks[$networkKey] = $currentBGPVRF
+                continue
+            }
+        }
+
+        # Parse BGP redistribute statements
+        if ($currentBGP) {
+            $m = $rxBGPRedistribute.Match($line)
+            if ($m.Success) {
+                $redistributeType = $m.Groups[1].Value
+                if ($redistributeType -eq "connected") {
+                    $device.BGPRedistributeConnected = $true
+                }
+                elseif ($redistributeType -eq "static") {
+                    $device.BGPRedistributeStatic = $true
+                }
+                continue
+            }
+        }
+
         # Parse OSPF process
         $m = $rxOSPFProcess.Match($line)
         if ($m.Success) {
@@ -652,10 +689,24 @@ function Parse-CiscoConfig {
 
 function ConvertTo-CIDR {
     param([string]$SubnetMask)
-    
+
     $octets = $SubnetMask -split '\.'
     $binary = ($octets | ForEach-Object { [Convert]::ToString([int]$_, 2).PadLeft(8, '0') }) -join ''
     return ($binary.ToCharArray() | Where-Object { $_ -eq '1' }).Count
+}
+
+function ConvertFrom-CIDR {
+    param([int]$CIDR)
+
+    # Create binary string with $CIDR number of 1s followed by 0s
+    $binary = ('1' * $CIDR).PadRight(32, '0')
+
+    # Convert to 4 octets
+    $octets = for ($i = 0; $i -lt 32; $i += 8) {
+        [Convert]::ToInt32($binary.Substring($i, 8), 2)
+    }
+
+    return $octets -join '.'
 }
 
 function Get-NetworkAddress {
@@ -821,7 +872,8 @@ function Get-QoSMarking {
 function Build-RoutingTable {
     param(
         [NetworkDevice]$Device,
-        [string]$VRF = "global"
+        [string]$VRF = "global",
+        [System.Collections.ArrayList]$AllDevices = $null
     )
 
     $routingTable = @()
@@ -853,7 +905,146 @@ function Build-RoutingTable {
     }
 
     # Add BGP routes (Admin Distance = 20 for eBGP, 200 for iBGP)
-    # This would require BGP RIB which we don't have from static configs
+    if ($Device.BGP_ASN -gt 0) {
+        # 1. Add locally originated BGP network statements
+        foreach ($networkKey in $Device.BGPNetworks.Keys) {
+            $networkVRF = $Device.BGPNetworks[$networkKey]
+            if ($networkVRF -eq $VRF) {
+                # Parse network/cidr
+                if ($networkKey -match '^(.+)/(\d+)$') {
+                    $network = $matches[1]
+                    $cidr = [int]$matches[2]
+
+                    # Calculate mask from CIDR
+                    $mask = ConvertFrom-CIDR -CIDR $cidr
+
+                    # Find which interface this network is on (if connected)
+                    $exitIface = $null
+                    foreach ($iface in $Device.Interfaces.Values) {
+                        if ($iface.Network -eq $network -and $iface.CIDR -eq $cidr) {
+                            $exitIface = $iface.Name
+                            break
+                        }
+                    }
+
+                    # Add as local BGP originated route (AD = 200 for locally originated)
+                    $routingTable += @{
+                        Destination = $network
+                        Mask = $mask
+                        NextHop = "Local"
+                        Metric = 0
+                        AdminDistance = 200
+                        Protocol = "BGP-Local"
+                        ExitInterface = $exitIface
+                    }
+                }
+            }
+        }
+
+        # 2. Add BGP-redistributed connected routes
+        if ($Device.BGPRedistributeConnected) {
+            # Already added as connected routes above, but mark them as BGP candidates
+        }
+
+        # 3. Add routes learned from BGP neighbors (including iBGP)
+        foreach ($neighbor in $Device.BGPNeighbors) {
+            if ($neighbor.VRF -eq $VRF -or ($neighbor.VRF -eq "global" -and $VRF -eq "global")) {
+                # Determine if eBGP or iBGP
+                $isIBGP = ($neighbor.RemoteAS -eq $Device.BGP_ASN)
+                $adminDistance = if ($isIBGP) { 200 } else { 20 }
+
+                # For eBGP: Add default route (common WAN scenario)
+                if (-not $isIBGP) {
+                    $routingTable += @{
+                        Destination = "0.0.0.0"
+                        Mask = "0.0.0.0"
+                        NextHop = $neighbor.IPAddress
+                        Metric = 0
+                        AdminDistance = $adminDistance
+                        Protocol = "eBGP"
+                        ExitInterface = $null  # Will be determined by next hop lookup
+                    }
+                }
+
+                # For iBGP: Learn routes from peer's BGP networks
+                if ($isIBGP -and $AllDevices) {
+                    # Find the iBGP peer device
+                    foreach ($peerDevice in $AllDevices) {
+                        if ($peerDevice.BGP_ASN -eq $neighbor.RemoteAS) {
+                            # Check if this device has the neighbor IP
+                            $isPeer = $false
+                            foreach ($iface in $peerDevice.Interfaces.Values) {
+                                if ($iface.IPAddress -eq $neighbor.IPAddress) {
+                                    $isPeer = $true
+                                    break
+                                }
+                            }
+
+                            if ($isPeer) {
+                                # Learn all BGP networks from this iBGP peer
+                                foreach ($peerNetworkKey in $peerDevice.BGPNetworks.Keys) {
+                                    $peerVRF = $peerDevice.BGPNetworks[$peerNetworkKey]
+                                    if ($peerVRF -eq $VRF) {
+                                        # Parse network/cidr
+                                        if ($peerNetworkKey -match '^(.+)/(\d+)$') {
+                                            $network = $matches[1]
+                                            $cidr = [int]$matches[2]
+                                            $mask = ConvertFrom-CIDR -CIDR $cidr
+
+                                            # Add as iBGP-learned route
+                                            $routingTable += @{
+                                                Destination = $network
+                                                Mask = $mask
+                                                NextHop = $neighbor.IPAddress
+                                                Metric = 0
+                                                AdminDistance = 200
+                                                Protocol = "iBGP"
+                                                ExitInterface = $null  # Will be determined by next hop lookup
+                                            }
+                                        }
+                                    }
+                                }
+
+                                # Also learn peer's connected routes if redistribute connected
+                                if ($peerDevice.BGPRedistributeConnected) {
+                                    foreach ($iface in $peerDevice.Interfaces.Values) {
+                                        if ($iface.VRF -eq $VRF -and $iface.IPAddress -and $iface.Network) {
+                                            $routingTable += @{
+                                                Destination = $iface.Network
+                                                Mask = $iface.SubnetMask
+                                                NextHop = $neighbor.IPAddress
+                                                Metric = 0
+                                                AdminDistance = 200
+                                                Protocol = "iBGP-Connected"
+                                                ExitInterface = $null
+                                            }
+                                        }
+                                    }
+                                }
+
+                                # Learn peer's static routes if redistribute static
+                                if ($peerDevice.BGPRedistributeStatic) {
+                                    foreach ($route in $peerDevice.Routes) {
+                                        if ($route.VRF -eq $VRF) {
+                                            $routingTable += @{
+                                                Destination = $route.Destination
+                                                Mask = $route.Mask
+                                                NextHop = $neighbor.IPAddress
+                                                Metric = 0
+                                                AdminDistance = 200
+                                                Protocol = "iBGP-Static"
+                                                ExitInterface = $null
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     # Add connected routes (Admin Distance = 0)
     foreach ($iface in $Device.Interfaces.Values) {
@@ -1049,10 +1240,183 @@ function Build-NetworkTopology {
     }
 
     Write-Host ""
+    Write-Host "  Building WAN peering connections..." -ForegroundColor Cyan
+
+    # Add connections based on BGP peering relationships
+    # Create stub devices for external WAN peers we don't have configs for
+    $bgpPeeringCount = 0
+    $externalWANDevices = @()
+
+    foreach ($device in $Devices) {
+        if ($device.BGPNeighbors.Count -gt 0) {
+            foreach ($neighbor in $device.BGPNeighbors) {
+                # Find the peer device by matching an interface with the neighbor IP
+                $peerDevice = $null
+                foreach ($otherDevice in $Devices) {
+                    if ($otherDevice.Hostname -eq $device.Hostname) { continue }
+
+                    foreach ($iface in $otherDevice.Interfaces.Values) {
+                        if ($iface.IPAddress -eq $neighbor.IPAddress) {
+                            $peerDevice = $otherDevice
+                            break
+                        }
+                    }
+                    if ($peerDevice) { break }
+                }
+
+                if (-not $peerDevice) {
+                    # Create external WAN device stub for this BGP peer
+                    $externalDeviceName = "WAN-Peer-AS$($neighbor.RemoteAS)-$($neighbor.IPAddress -replace '\.', '-')"
+
+                    # Check if we already created this external device
+                    $peerDevice = $Devices | Where-Object { $_.Hostname -eq $externalDeviceName } | Select-Object -First 1
+
+                    if (-not $peerDevice) {
+                        $peerDevice = [NetworkDevice]::new($externalDeviceName)
+                        $peerDevice.DeviceType = "External-WAN"
+                        $peerDevice.BGP_ASN = $neighbor.RemoteAS
+
+                        # Create a virtual interface on the external device
+                        $virtualIface = [NetworkInterface]::new("WAN-Interface")
+                        $virtualIface.IPAddress = $neighbor.IPAddress
+                        # Try to determine subnet from local interface
+                        foreach ($iface in $device.Interfaces.Values) {
+                            if ($iface.IPAddress -and $iface.Network) {
+                                if (Test-SameSubnet -IP1 $iface.IPAddress -Mask1 $iface.SubnetMask -IP2 $neighbor.IPAddress -Mask2 $iface.SubnetMask) {
+                                    $virtualIface.SubnetMask = $iface.SubnetMask
+                                    $virtualIface.CIDR = $iface.CIDR
+                                    $virtualIface.Network = $iface.Network
+                                    $virtualIface.VRF = $iface.VRF
+                                    break
+                                }
+                            }
+                        }
+                        $peerDevice.Interfaces["WAN-Interface"] = $virtualIface
+
+                        [void]$Devices.Add($peerDevice)
+                        $externalWANDevices += $externalDeviceName
+                        Write-Host "    Created external WAN device: $externalDeviceName (AS$($neighbor.RemoteAS))" -ForegroundColor DarkCyan
+                    }
+                }
+
+                # Check if connection already exists
+                $existingConn = $connections | Where-Object {
+                    ($_.Device1.Hostname -eq $device.Hostname -and $_.Device2.Hostname -eq $peerDevice.Hostname) -or
+                    ($_.Device2.Hostname -eq $device.Hostname -and $_.Device1.Hostname -eq $peerDevice.Hostname)
+                } | Select-Object -First 1
+
+                if (-not $existingConn) {
+                    # Create BGP peering connection
+                    $conn = [Connection]::new($device, $peerDevice)
+
+                    # Find local interface
+                    $localIface = $null
+                    foreach ($iface in $device.Interfaces.Values) {
+                        if ($iface.IPAddress -and $iface.Network) {
+                            # Check if neighbor IP is in same subnet
+                            if (Test-SameSubnet -IP1 $iface.IPAddress -Mask1 $iface.SubnetMask -IP2 $neighbor.IPAddress -Mask2 $iface.SubnetMask) {
+                                $localIface = $iface.Name
+                                break
+                            }
+                        }
+                    }
+
+                    $remoteIface = "WAN-Interface"
+                    if ($peerDevice.DeviceType -ne "External-WAN") {
+                        foreach ($iface in $peerDevice.Interfaces.Values) {
+                            if ($iface.IPAddress -eq $neighbor.IPAddress) {
+                                $remoteIface = $iface.Name
+                                break
+                            }
+                        }
+                    }
+
+                    $conn.Interface1 = if ($localIface) { $localIface } else { "BGP-Peering" }
+                    $conn.Interface2 = $remoteIface
+                    $conn.ConnectionType = "BGP-Peering"
+                    $connections += $conn
+                    $bgpPeeringCount++
+
+                    if ($peerDevice.DeviceType -eq "External-WAN") {
+                        Write-Host "    BGP Peering: $($device.Hostname) (AS$($device.BGP_ASN)) <-> EXTERNAL WAN (AS$($neighbor.RemoteAS))" -ForegroundColor Magenta
+                    } else {
+                        Write-Host "    BGP Peering: $($device.Hostname) (AS$($device.BGP_ASN)) <-> $($peerDevice.Hostname) (AS$($neighbor.RemoteAS))" -ForegroundColor Magenta
+                    }
+                }
+            }
+        }
+    }
+
+    # Add connections based on OSPF adjacencies (if not already connected)
+    $ospfAdjacencyCount = 0
+    foreach ($device in $Devices) {
+        if ($device.OSPFProcesses.Count -gt 0) {
+            # For each OSPF-enabled interface, find potential neighbors
+            foreach ($iface in $device.Interfaces.Values) {
+                if (-not $iface.IPAddress -or -not $iface.Network) { continue }
+
+                # Check if this interface is in an OSPF network
+                $inOspfNetwork = $false
+                foreach ($ospfProc in $device.OSPFProcesses.Values) {
+                    # Check if interface is passive (no adjacencies)
+                    if ($ospfProc.PassiveInterfaces -contains $iface.Name) {
+                        continue
+                    }
+
+                    # Simple check: if OSPF is running and interface has IP, assume it could form adjacency
+                    if ($ospfProc.Networks.Count -gt 0) {
+                        $inOspfNetwork = $true
+                        break
+                    }
+                }
+
+                if ($inOspfNetwork) {
+                    # Find other devices on the same subnet with OSPF
+                    foreach ($otherDevice in $Devices) {
+                        if ($otherDevice.Hostname -eq $device.Hostname) { continue }
+                        if ($otherDevice.OSPFProcesses.Count -eq 0) { continue }
+
+                        foreach ($otherIface in $otherDevice.Interfaces.Values) {
+                            if (-not $otherIface.IPAddress) { continue }
+
+                            # Check if on same subnet
+                            if ($iface.Network -eq $otherIface.Network -and $iface.CIDR -eq $otherIface.CIDR -and $iface.VRF -eq $otherIface.VRF) {
+                                # Check if connection already exists
+                                $existingConn = $connections | Where-Object {
+                                    ($_.Device1.Hostname -eq $device.Hostname -and $_.Device2.Hostname -eq $otherDevice.Hostname) -or
+                                    ($_.Device2.Hostname -eq $device.Hostname -and $_.Device1.Hostname -eq $otherDevice.Hostname)
+                                } | Select-Object -First 1
+
+                                if (-not $existingConn) {
+                                    $conn = [Connection]::new($device, $otherDevice)
+                                    $conn.Interface1 = $iface.Name
+                                    $conn.Interface2 = $otherIface.Name
+                                    $conn.ConnectionType = "OSPF-Adjacency"
+                                    $connections += $conn
+                                    $ospfAdjacencyCount++
+
+                                    Write-Host "    OSPF Adjacency: $($device.Hostname):$($iface.Name) <-> $($otherDevice.Hostname):$($otherIface.Name)" -ForegroundColor Cyan
+                                }
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Write-Host ""
     Write-Host "  Topology Summary:" -ForegroundColor Cyan
     Write-Host "    Connected subnets: $connectedSubnets" -ForegroundColor Green
+    Write-Host "    BGP peerings: $bgpPeeringCount" -ForegroundColor Magenta
+    Write-Host "    OSPF adjacencies: $ospfAdjacencyCount" -ForegroundColor Cyan
+    if ($externalWANDevices.Count -gt 0) {
+        Write-Host "    External WAN devices created: $($externalWANDevices.Count)" -ForegroundColor DarkCyan
+    }
     Write-Host "    Isolated interfaces: $isolatedCount" -ForegroundColor Yellow
     Write-Host "    Total connections created: $($connections.Count)" -ForegroundColor Green
+    Write-Host "    Total devices (including external WAN): $($Devices.Count)" -ForegroundColor Gray
 
     return $connections
 }
@@ -1625,7 +1989,7 @@ function Find-RoutingPath {
             }
         }
 
-        $routingTable = Build-RoutingTable -Device $currentDevice -VRF $deviceVRF
+        $routingTable = Build-RoutingTable -Device $currentDevice -VRF $deviceVRF -AllDevices $AllDevices
         $bestRoute = Find-BestRoute -RoutingTable $routingTable -DestIP $DestIP
 
         if (-not $bestRoute) {
@@ -1751,7 +2115,7 @@ function Get-ComprehensivePathAnalysis {
                 $hopAnalysis.VRF = $exitIface.VRF
 
                 # Build routing table
-                $routingTable = Build-RoutingTable -Device $device -VRF $exitIface.VRF
+                $routingTable = Build-RoutingTable -Device $device -VRF $exitIface.VRF -AllDevices $AllDevices
                 $bestRoute = Find-BestRoute -RoutingTable $routingTable -DestIP $DestIP
 
                 if ($bestRoute) {
@@ -1957,10 +2321,8 @@ function Show-NetworkMap {
                     }
                 }
 
-                # Auto-select first interface if available
-                if ($sourceInterfaceCombo.Items.Count -gt 0) {
-                    $sourceInterfaceCombo.SelectedIndex = 0
-                }
+                # Don't auto-select - let user choose which interface/IP they want to use as source
+                # This gives more control over the source IP for the trace
             }
         }
     })
@@ -2000,10 +2362,8 @@ function Show-NetworkMap {
                     }
                 }
 
-                # Auto-select first interface if available
-                if ($destInterfaceCombo.Items.Count -gt 0) {
-                    $destInterfaceCombo.SelectedIndex = 0
-                }
+                # Don't auto-select - let user choose which interface/IP they want to trace to
+                # This allows tracing to any interface on the device, not just the first one
             }
         }
     })
@@ -2490,11 +2850,39 @@ function Show-NetworkMap {
                         }
 
                         if ($connection) {
-                            # Determine the subnet they share
+                            # Determine the subnet they share and connection type
                             $exitIface = $hop.Device.Interfaces[$hop.ExitInterface]
+
+                            $details += "  |                                                                 |`n"
+                            $details += "  |   === Physical Link ===                                         |`n"
+
+                            # Show connection type
+                            if ($connection.ConnectionType -eq "BGP-Peering") {
+                                $details += "  |   Connection Type: BGP Peering (WAN)                           |`n"
+                                $details += "  |   Protocol: BGP                                                 |`n"
+
+                                # Show AS numbers if available
+                                if ($hop.Device.BGP_ASN -gt 0) {
+                                    $details += "  |   Local AS: $($hop.Device.BGP_ASN)"
+                                    $details += " " * (52 - $hop.Device.BGP_ASN.ToString().Length) + "|`n"
+                                }
+
+                                $peerAS = ($hop.Device.BGPNeighbors | Where-Object { $_.IPAddress -eq $nextHop.EntryIP -or $Connections | Where-Object { $_.Device2.Hostname -eq $nextHop.Device.Hostname } }).RemoteAS
+                                if ($peerAS) {
+                                    $details += "  |   Remote AS: $peerAS"
+                                    $details += " " * (51 - $peerAS.ToString().Length) + "|`n"
+                                }
+                            }
+                            elseif ($connection.ConnectionType -eq "OSPF-Adjacency") {
+                                $details += "  |   Connection Type: OSPF Adjacency (WAN/LAN)                    |`n"
+                                $details += "  |   Protocol: OSPF                                                |`n"
+                            }
+                            else {
+                                $details += "  |   Connection Type: Layer 3 (Routed)                            |`n"
+                            }
+
+                            # Show subnet information
                             if ($exitIface -and $exitIface.Network -and $exitIface.CIDR) {
-                                $details += "  |                                                                 |`n"
-                                $details += "  |   === Physical Link ===                                         |`n"
                                 $details += "  |   Shared Subnet: $($exitIface.Network)/$($exitIface.CIDR)"
                                 $details += " " * (41 - $exitIface.Network.Length - $exitIface.CIDR.ToString().Length) + "|`n"
 
@@ -2502,8 +2890,13 @@ function Show-NetworkMap {
                                     $details += "  |   VRF: $($exitIface.VRF)"
                                     $details += " " * (58 - $exitIface.VRF.Length) + "|`n"
                                 }
+                            }
 
-                                $details += "  |   Connection Type: Layer 3 (Routed)                            |`n"
+                            # Show WAN link type if applicable
+                            if ($hop.ExitInterface -match '^(Serial|Tunnel|Dialer|Cellular|ATM|Frame-Relay)') {
+                                $linkType = $hop.ExitInterface -replace '(\d+/\d+|\d+).*', ''
+                                $details += "  |   WAN Interface Type: $linkType"
+                                $details += " " * (42 - $linkType.Length) + "|`n"
                             }
                         }
 
@@ -2782,6 +3175,15 @@ function Show-NetworkMap {
     $clearButton.Add_Click({
         Reset-AllDevices  # Reset ALL devices to default colors
         $detailsBox.Text = ""
+
+        # Clear all selections
+        $sourceCombo.SelectedIndex = -1
+        $destCombo.SelectedIndex = -1
+        $sourceInterfaceCombo.Items.Clear()
+        $destInterfaceCombo.Items.Clear()
+        $sourceIPBox.Text = "10.10.10.100"  # Reset to default
+        $destIPBox.Text = "10.20.20.100"    # Reset to default
+        $useRoutingCheckBox.IsChecked = $true  # Reset to default
     })
     
     # Show window
