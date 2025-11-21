@@ -1476,13 +1476,15 @@ function Show-NetworkMap {
                 <Button Name="TraceButton" Content="Trace Path" Width="100" Margin="20,0,5,0" Padding="5"/>
                 <Button Name="ClearButton" Content="Clear" Width="80" Margin="5,0,0,0" Padding="5"/>
             </StackPanel>
-            <!-- Second row: IP specification -->
+            <!-- Second row: IP/Interface specification -->
             <StackPanel Orientation="Horizontal" Margin="0,0,0,5">
-                <Label Content="Source IP:" VerticalAlignment="Center" Width="100"/>
+                <Label Content="Source Interface:" VerticalAlignment="Center" Width="100"/>
+                <ComboBox Name="SourceInterfaceCombo" Width="150" Margin="5,0,0,0"/>
+                <Label Content="Source IP:" VerticalAlignment="Center" Margin="10,0,0,0" Width="70"/>
                 <TextBox Name="SourceIPBox" Width="120" Margin="5,0,0,0" Text="10.10.10.100" VerticalContentAlignment="Center"/>
-                <Label Content="Destination IP:" VerticalAlignment="Center" Margin="20,0,0,0" Width="130"/>
+                <Label Content="Destination IP:" VerticalAlignment="Center" Margin="10,0,0,0" Width="100"/>
                 <TextBox Name="DestIPBox" Width="120" Margin="5,0,0,0" Text="10.20.20.100" VerticalContentAlignment="Center"/>
-                <CheckBox Name="UseRoutingCheckBox" Content="Use Routing Tables" VerticalAlignment="Center" Margin="20,0,0,0" IsChecked="True"/>
+                <CheckBox Name="UseRoutingCheckBox" Content="Use Routing Tables" VerticalAlignment="Center" Margin="10,0,0,0" IsChecked="True"/>
             </StackPanel>
         </StackPanel>
         
@@ -1522,18 +1524,62 @@ function Show-NetworkMap {
     $canvas = $window.FindName("NetworkCanvas")
     $sourceCombo = $window.FindName("SourceCombo")
     $destCombo = $window.FindName("DestCombo")
+    $sourceInterfaceCombo = $window.FindName("SourceInterfaceCombo")
     $sourceIPBox = $window.FindName("SourceIPBox")
     $destIPBox = $window.FindName("DestIPBox")
     $useRoutingCheckBox = $window.FindName("UseRoutingCheckBox")
     $traceButton = $window.FindName("TraceButton")
     $clearButton = $window.FindName("ClearButton")
     $detailsBox = $window.FindName("DetailsBox")
-    
-    # Populate combo boxes
+
+    # Populate device combo boxes
     foreach ($device in $Devices) {
         [void]$sourceCombo.Items.Add($device.Hostname)
         [void]$destCombo.Items.Add($device.Hostname)
     }
+
+    # Event handler: Populate interfaces when source device changes
+    $sourceCombo.Add_SelectionChanged({
+        $sourceInterfaceCombo.Items.Clear()
+        $sourceIPBox.Text = ""
+
+        if ($sourceCombo.SelectedItem) {
+            $selectedDevice = $Devices | Where-Object { $_.Hostname -eq $sourceCombo.SelectedItem }
+
+            if ($selectedDevice -and $selectedDevice.Interfaces) {
+                # Add interfaces with their IPs for easy selection
+                foreach ($ifaceName in $selectedDevice.Interfaces.Keys) {
+                    $iface = $selectedDevice.Interfaces[$ifaceName]
+                    if ($iface.IPAddress) {
+                        $displayText = "$ifaceName ($($iface.IPAddress))"
+                        [void]$sourceInterfaceCombo.Items.Add($displayText)
+                    }
+                }
+
+                # Auto-select first interface if available
+                if ($sourceInterfaceCombo.Items.Count -gt 0) {
+                    $sourceInterfaceCombo.SelectedIndex = 0
+                }
+            }
+        }
+    })
+
+    # Event handler: Auto-fill IP when interface is selected
+    $sourceInterfaceCombo.Add_SelectionChanged({
+        if ($sourceInterfaceCombo.SelectedItem -and $sourceCombo.SelectedItem) {
+            $selectedDevice = $Devices | Where-Object { $_.Hostname -eq $sourceCombo.SelectedItem }
+
+            if ($selectedDevice) {
+                # Extract interface name from "InterfaceName (IP)" format
+                $selectedText = $sourceInterfaceCombo.SelectedItem.ToString()
+                if ($selectedText -match '^(.+?)\s+\((.+?)\)$') {
+                    $ifaceName = $matches[1]
+                    $ifaceIP = $matches[2]
+                    $sourceIPBox.Text = $ifaceIP
+                }
+            }
+        }
+    })
     
     # Store UI element references for efficient updates (avoids full redraw)
     $script:deviceElements = @{}
