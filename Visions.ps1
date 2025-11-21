@@ -1049,8 +1049,138 @@ function Build-NetworkTopology {
     }
 
     Write-Host ""
+    Write-Host "  Building WAN peering connections..." -ForegroundColor Cyan
+
+    # Add connections based on BGP peering relationships
+    $bgpPeeringCount = 0
+    foreach ($device in $Devices) {
+        if ($device.BGPNeighbors.Count -gt 0) {
+            foreach ($neighbor in $device.BGPNeighbors) {
+                # Find the peer device by matching an interface with the neighbor IP
+                $peerDevice = $null
+                foreach ($otherDevice in $Devices) {
+                    if ($otherDevice.Hostname -eq $device.Hostname) { continue }
+
+                    foreach ($iface in $otherDevice.Interfaces.Values) {
+                        if ($iface.IPAddress -eq $neighbor.IPAddress) {
+                            $peerDevice = $otherDevice
+                            break
+                        }
+                    }
+                    if ($peerDevice) { break }
+                }
+
+                if ($peerDevice) {
+                    # Check if connection already exists
+                    $existingConn = $connections | Where-Object {
+                        ($_.Device1.Hostname -eq $device.Hostname -and $_.Device2.Hostname -eq $peerDevice.Hostname) -or
+                        ($_.Device2.Hostname -eq $device.Hostname -and $_.Device1.Hostname -eq $peerDevice.Hostname)
+                    } | Select-Object -First 1
+
+                    if (-not $existingConn) {
+                        # Create BGP peering connection
+                        $conn = [Connection]::new($device, $peerDevice)
+
+                        # Find interfaces involved
+                        $localIface = $null
+                        foreach ($iface in $device.Interfaces.Values) {
+                            if ($iface.IPAddress -and $iface.Network) {
+                                # Check if neighbor IP is in same subnet
+                                if (Test-SameSubnet -IP1 $iface.IPAddress -Mask1 $iface.SubnetMask -IP2 $neighbor.IPAddress -Mask2 $iface.SubnetMask) {
+                                    $localIface = $iface.Name
+                                    break
+                                }
+                            }
+                        }
+
+                        $remoteIface = $null
+                        foreach ($iface in $peerDevice.Interfaces.Values) {
+                            if ($iface.IPAddress -eq $neighbor.IPAddress) {
+                                $remoteIface = $iface.Name
+                                break
+                            }
+                        }
+
+                        $conn.Interface1 = if ($localIface) { $localIface } else { "BGP-Peering" }
+                        $conn.Interface2 = if ($remoteIface) { $remoteIface } else { "BGP-Peering" }
+                        $conn.ConnectionType = "BGP-Peering"
+                        $connections += $conn
+                        $bgpPeeringCount++
+
+                        Write-Host "    BGP Peering: $($device.Hostname) (AS$($device.BGP_ASN)) <-> $($peerDevice.Hostname) (AS$($neighbor.RemoteAS))" -ForegroundColor Magenta
+                    }
+                }
+                else {
+                    Write-Host "    BGP Peer NOT FOUND: $($device.Hostname) neighbor $($neighbor.IPAddress) (AS$($neighbor.RemoteAS))" -ForegroundColor DarkYellow
+                }
+            }
+        }
+    }
+
+    # Add connections based on OSPF adjacencies (if not already connected)
+    $ospfAdjacencyCount = 0
+    foreach ($device in $Devices) {
+        if ($device.OSPFProcesses.Count -gt 0) {
+            # For each OSPF-enabled interface, find potential neighbors
+            foreach ($iface in $device.Interfaces.Values) {
+                if (-not $iface.IPAddress -or -not $iface.Network) { continue }
+
+                # Check if this interface is in an OSPF network
+                $inOspfNetwork = $false
+                foreach ($ospfProc in $device.OSPFProcesses.Values) {
+                    # Check if interface is passive (no adjacencies)
+                    if ($ospfProc.PassiveInterfaces -contains $iface.Name) {
+                        continue
+                    }
+
+                    # Simple check: if OSPF is running and interface has IP, assume it could form adjacency
+                    if ($ospfProc.Networks.Count -gt 0) {
+                        $inOspfNetwork = $true
+                        break
+                    }
+                }
+
+                if ($inOspfNetwork) {
+                    # Find other devices on the same subnet with OSPF
+                    foreach ($otherDevice in $Devices) {
+                        if ($otherDevice.Hostname -eq $device.Hostname) { continue }
+                        if ($otherDevice.OSPFProcesses.Count -eq 0) { continue }
+
+                        foreach ($otherIface in $otherDevice.Interfaces.Values) {
+                            if (-not $otherIface.IPAddress) { continue }
+
+                            # Check if on same subnet
+                            if ($iface.Network -eq $otherIface.Network -and $iface.CIDR -eq $otherIface.CIDR -and $iface.VRF -eq $otherIface.VRF) {
+                                # Check if connection already exists
+                                $existingConn = $connections | Where-Object {
+                                    ($_.Device1.Hostname -eq $device.Hostname -and $_.Device2.Hostname -eq $otherDevice.Hostname) -or
+                                    ($_.Device2.Hostname -eq $device.Hostname -and $_.Device1.Hostname -eq $otherDevice.Hostname)
+                                } | Select-Object -First 1
+
+                                if (-not $existingConn) {
+                                    $conn = [Connection]::new($device, $otherDevice)
+                                    $conn.Interface1 = $iface.Name
+                                    $conn.Interface2 = $otherIface.Name
+                                    $conn.ConnectionType = "OSPF-Adjacency"
+                                    $connections += $conn
+                                    $ospfAdjacencyCount++
+
+                                    Write-Host "    OSPF Adjacency: $($device.Hostname):$($iface.Name) <-> $($otherDevice.Hostname):$($otherIface.Name)" -ForegroundColor Cyan
+                                }
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Write-Host ""
     Write-Host "  Topology Summary:" -ForegroundColor Cyan
     Write-Host "    Connected subnets: $connectedSubnets" -ForegroundColor Green
+    Write-Host "    BGP peerings: $bgpPeeringCount" -ForegroundColor Magenta
+    Write-Host "    OSPF adjacencies: $ospfAdjacencyCount" -ForegroundColor Cyan
     Write-Host "    Isolated interfaces: $isolatedCount" -ForegroundColor Yellow
     Write-Host "    Total connections created: $($connections.Count)" -ForegroundColor Green
 
@@ -2486,11 +2616,39 @@ function Show-NetworkMap {
                         }
 
                         if ($connection) {
-                            # Determine the subnet they share
+                            # Determine the subnet they share and connection type
                             $exitIface = $hop.Device.Interfaces[$hop.ExitInterface]
+
+                            $details += "  |                                                                 |`n"
+                            $details += "  |   === Physical Link ===                                         |`n"
+
+                            # Show connection type
+                            if ($connection.ConnectionType -eq "BGP-Peering") {
+                                $details += "  |   Connection Type: BGP Peering (WAN)                           |`n"
+                                $details += "  |   Protocol: BGP                                                 |`n"
+
+                                # Show AS numbers if available
+                                if ($hop.Device.BGP_ASN -gt 0) {
+                                    $details += "  |   Local AS: $($hop.Device.BGP_ASN)"
+                                    $details += " " * (52 - $hop.Device.BGP_ASN.ToString().Length) + "|`n"
+                                }
+
+                                $peerAS = ($hop.Device.BGPNeighbors | Where-Object { $_.IPAddress -eq $nextHop.EntryIP -or $Connections | Where-Object { $_.Device2.Hostname -eq $nextHop.Device.Hostname } }).RemoteAS
+                                if ($peerAS) {
+                                    $details += "  |   Remote AS: $peerAS"
+                                    $details += " " * (51 - $peerAS.ToString().Length) + "|`n"
+                                }
+                            }
+                            elseif ($connection.ConnectionType -eq "OSPF-Adjacency") {
+                                $details += "  |   Connection Type: OSPF Adjacency (WAN/LAN)                    |`n"
+                                $details += "  |   Protocol: OSPF                                                |`n"
+                            }
+                            else {
+                                $details += "  |   Connection Type: Layer 3 (Routed)                            |`n"
+                            }
+
+                            # Show subnet information
                             if ($exitIface -and $exitIface.Network -and $exitIface.CIDR) {
-                                $details += "  |                                                                 |`n"
-                                $details += "  |   === Physical Link ===                                         |`n"
                                 $details += "  |   Shared Subnet: $($exitIface.Network)/$($exitIface.CIDR)"
                                 $details += " " * (41 - $exitIface.Network.Length - $exitIface.CIDR.ToString().Length) + "|`n"
 
@@ -2498,8 +2656,13 @@ function Show-NetworkMap {
                                     $details += "  |   VRF: $($exitIface.VRF)"
                                     $details += " " * (58 - $exitIface.VRF.Length) + "|`n"
                                 }
+                            }
 
-                                $details += "  |   Connection Type: Layer 3 (Routed)                            |`n"
+                            # Show WAN link type if applicable
+                            if ($hop.ExitInterface -match '^(Serial|Tunnel|Dialer|Cellular|ATM|Frame-Relay)') {
+                                $linkType = $hop.ExitInterface -replace '(\d+/\d+|\d+).*', ''
+                                $details += "  |   WAN Interface Type: $linkType"
+                                $details += " " * (42 - $linkType.Length) + "|`n"
                             }
                         }
 
