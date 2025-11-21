@@ -1845,6 +1845,8 @@ function Show-NetworkMap {
     $script:deviceElements = @{}
     $script:connectionElements = @{}
     $script:highlightElements = @()
+    $script:highlightedDevices = @{}  # Track which devices are currently highlighted
+    $script:highlightedConnections = @{}  # Track which connections are currently highlighted
 
     # Draw network topology (initial draw only)
     function Draw-Topology {
@@ -1923,24 +1925,53 @@ function Show-NetworkMap {
 
     # Clear highlights only (efficient - doesn't redraw everything)
     function Clear-Highlights {
-        # Remove highlight elements
+        # Remove highlight overlay elements
         foreach ($elem in $script:highlightElements) {
             [void]$canvas.Children.Remove($elem)
         }
         $script:highlightElements.Clear()
 
-        # Reset connection colors
+        # Reset ONLY previously highlighted connections
+        foreach ($connKey in $script:highlightedConnections.Keys) {
+            if ($script:connectionElements.ContainsKey($connKey)) {
+                $script:connectionElements[$connKey].Stroke = [System.Windows.Media.Brushes]::Gray
+                $script:connectionElements[$connKey].StrokeThickness = 2
+            }
+        }
+        $script:highlightedConnections.Clear()
+
+        # Reset ONLY previously highlighted devices
+        foreach ($deviceName in $script:highlightedDevices.Keys) {
+            if ($script:deviceElements.ContainsKey($deviceName)) {
+                $script:deviceElements[$deviceName].Ellipse.Fill = [System.Windows.Media.Brushes]::LightBlue
+                $script:deviceElements[$deviceName].Ellipse.Stroke = [System.Windows.Media.Brushes]::DarkBlue
+                $script:deviceElements[$deviceName].Ellipse.StrokeThickness = 2
+            }
+        }
+        $script:highlightedDevices.Clear()
+    }
+
+    function Reset-AllDevices {
+        # Remove highlight overlay elements
+        foreach ($elem in $script:highlightElements) {
+            [void]$canvas.Children.Remove($elem)
+        }
+        $script:highlightElements.Clear()
+
+        # Reset ALL connection colors
         foreach ($line in $script:connectionElements.Values) {
             $line.Stroke = [System.Windows.Media.Brushes]::Gray
             $line.StrokeThickness = 2
         }
+        $script:highlightedConnections.Clear()
 
-        # Reset device colors
+        # Reset ALL device colors
         foreach ($devElements in $script:deviceElements.Values) {
             $devElements.Ellipse.Fill = [System.Windows.Media.Brushes]::LightBlue
             $devElements.Ellipse.Stroke = [System.Windows.Media.Brushes]::DarkBlue
             $devElements.Ellipse.StrokeThickness = 2
         }
+        $script:highlightedDevices.Clear()
     }
 
     Draw-Topology
@@ -2012,15 +2043,22 @@ function Show-NetworkMap {
                     $line.StrokeThickness = 4
                     [void]$canvas.Children.Add($line)
                     $script:highlightElements += $line
+
+                    # Track highlighted connection
+                    $connKey = "$dev1Name-$dev2Name"
+                    $script:highlightedConnections[$connKey] = $true
                 }
             }
 
-            # Highlight devices in path
+            # Highlight devices in path (ONLY devices in path)
             foreach ($deviceName in $path) {
                 if ($script:deviceElements.ContainsKey($deviceName)) {
                     $script:deviceElements[$deviceName].Ellipse.Fill = [System.Windows.Media.Brushes]::LightGreen
                     $script:deviceElements[$deviceName].Ellipse.Stroke = [System.Windows.Media.Brushes]::DarkGreen
                     $script:deviceElements[$deviceName].Ellipse.StrokeThickness = 3
+
+                    # Track highlighted device
+                    $script:highlightedDevices[$deviceName] = $true
                 }
             }
 
@@ -2165,15 +2203,22 @@ function Show-NetworkMap {
                     $line.StrokeThickness = 4
                     [void]$canvas.Children.Add($line)
                     $script:highlightElements += $line
+
+                    # Track highlighted connection
+                    $connKey = "$dev1Name-$dev2Name"
+                    $script:highlightedConnections[$connKey] = $true
                 }
             }
 
-            # Highlight devices in path
+            # Highlight devices in path (ONLY devices in path)
             foreach ($deviceName in $path) {
                 if ($script:deviceElements.ContainsKey($deviceName)) {
                     $script:deviceElements[$deviceName].Ellipse.Fill = [System.Windows.Media.Brushes]::LightGreen
                     $script:deviceElements[$deviceName].Ellipse.Stroke = [System.Windows.Media.Brushes]::DarkGreen
                     $script:deviceElements[$deviceName].Ellipse.StrokeThickness = 3
+
+                    # Track highlighted device
+                    $script:highlightedDevices[$deviceName] = $true
                 }
             }
 
@@ -2236,7 +2281,7 @@ function Show-NetworkMap {
     
     # Clear button handler
     $clearButton.Add_Click({
-        Clear-Highlights
+        Reset-AllDevices  # Reset ALL devices to default colors
         $detailsBox.Text = ""
     })
     
