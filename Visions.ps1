@@ -631,10 +631,10 @@ function Parse-CiscoConfig {
     # Score >= 10: Definitely a router (has routing protocols)
     # Score >= 5: Likely a router (has routing features)
     # Score < 5: Keep interface-based detection
-    if ($routingScore >= 10) {
+    if ($routingScore -ge 10) {
         $device.DeviceType = "Router"
     }
-    elseif ($routingScore >= 5 -and $device.DeviceType -eq "Switch") {
+    elseif ($routingScore -ge 5 -and $device.DeviceType -eq "Switch") {
         # L3 switch with significant routing - call it a router
         $device.DeviceType = "Router"
     }
