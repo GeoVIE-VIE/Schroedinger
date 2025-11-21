@@ -919,12 +919,27 @@ function Build-NetworkTopology {
     $subnetMap = @{}
 
     Write-Host "  Building topology from interface subnets..." -ForegroundColor Cyan
+    Write-Host "    Analyzing devices for connectivity..." -ForegroundColor Gray
 
     foreach ($device in $Devices) {
         $deviceHasConnections = $false
+        $interfacesWithIP = 0
+        $interfacesWithoutSubnet = 0
+
         foreach ($iface in $device.Interfaces.Values) {
-            # Skip interfaces without IP addresses
-            if (-not $iface.IPAddress -or -not $iface.Network) {
+            # Count interfaces with IPs
+            if ($iface.IPAddress) {
+                $interfacesWithIP++
+            }
+
+            # Skip interfaces without IP addresses or network calculation
+            if (-not $iface.IPAddress) {
+                continue
+            }
+
+            if (-not $iface.Network -or -not $iface.SubnetMask) {
+                $interfacesWithoutSubnet++
+                Write-Host "    DEBUG: $($device.Hostname) $($iface.Name) ($($iface.IPAddress)) - missing subnet mask" -ForegroundColor DarkYellow
                 continue
             }
 
@@ -943,13 +958,25 @@ function Build-NetworkTopology {
             $deviceHasConnections = $true
         }
 
-        # Warn if device has no routable interfaces
-        if (-not $deviceHasConnections -and $device.Interfaces.Count -gt 0) {
-            Write-Host "    WARNING: $($device.Hostname) has $($device.Interfaces.Count) interface(s) but none have valid IP/subnet" -ForegroundColor Yellow
+        # Detailed diagnostics for devices without connections
+        if (-not $deviceHasConnections) {
+            if ($device.Interfaces.Count -eq 0) {
+                Write-Host "    WARNING: $($device.Hostname) has NO interfaces in config" -ForegroundColor Red
+            }
+            elseif ($interfacesWithIP -eq 0) {
+                Write-Host "    WARNING: $($device.Hostname) has $($device.Interfaces.Count) interface(s) but NONE have IP addresses" -ForegroundColor Yellow
+            }
+            elseif ($interfacesWithoutSubnet -gt 0) {
+                Write-Host "    WARNING: $($device.Hostname) has $interfacesWithIP interface(s) with IPs but ALL are missing subnet masks" -ForegroundColor Yellow
+            }
         }
     }
 
     # Now find connections only within same VRF+subnet (much faster!)
+    Write-Host "    Creating connections from shared subnets..." -ForegroundColor Gray
+    $isolatedCount = 0
+    $connectedSubnets = 0
+
     foreach ($key in $subnetMap.Keys) {
         $members = $subnetMap[$key]
 
@@ -958,9 +985,15 @@ function Build-NetworkTopology {
             $isolatedDevice = $members[0].Device.Hostname
             $isolatedIface = $members[0].Interface.Name
             $isolatedIP = $members[0].Interface.IPAddress
-            Write-Host "    INFO: $isolatedDevice $isolatedIface ($isolatedIP) is alone in subnet $key" -ForegroundColor Gray
+            Write-Host "    ISOLATED: $isolatedDevice $isolatedIface ($isolatedIP) has no neighbors in $key" -ForegroundColor DarkGray
+            $isolatedCount++
             continue
         }
+
+        # Show connected subnet
+        $deviceList = ($members | ForEach-Object { "$($_.Device.Hostname):$($_.Interface.Name)" }) -join ", "
+        Write-Host "    CONNECTED: Subnet $key has $($members.Count) members: $deviceList" -ForegroundColor Green
+        $connectedSubnets++
 
         # Create connections between all pairs in this subnet
         for ($i = 0; $i -lt $members.Count; $i++) {
@@ -979,6 +1012,12 @@ function Build-NetworkTopology {
             }
         }
     }
+
+    Write-Host ""
+    Write-Host "  Topology Summary:" -ForegroundColor Cyan
+    Write-Host "    Connected subnets: $connectedSubnets" -ForegroundColor Green
+    Write-Host "    Isolated interfaces: $isolatedCount" -ForegroundColor Yellow
+    Write-Host "    Total connections created: $($connections.Count)" -ForegroundColor Green
 
     return $connections
 }
@@ -2250,49 +2289,171 @@ function Show-NetworkMap {
             }
 
             # Display routing-aware path details
-            $details = "ROUTING-AWARE PATH TRACE`n"
-            $details += "Source: $($srcDevice.Hostname) ($sourceIP)`n"
-            $details += "Destination: $destIP`n"
+            $details = "╔═══════════════════════════════════════════════════════════════════════════════╗`n"
+            $details += "║                        ROUTING-AWARE PATH TRACE                               ║`n"
+            $details += "╚═══════════════════════════════════════════════════════════════════════════════╝`n"
+            $details += "`n"
+            $details += "Source Device:      $($srcDevice.Hostname) [$($srcDevice.DeviceType)]`n"
+            $details += "Source IP:          $sourceIP`n"
+            $details += "Destination IP:     $destIP`n"
+            $details += "Trace Time:         $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n"
+            $details += "`n"
             $details += "=" * 80 + "`n`n"
 
             $currentIP = $sourceIP
             foreach ($hop in $routingPath) {
-                $details += "Hop $($hop.HopNumber): $($hop.Device.Hostname) ($($hop.Device.DeviceType))`n"
+                $details += "┌─────────────────────────────────────────────────────────────────────────────┐`n"
+                $details += "│ HOP $($hop.HopNumber): $($hop.Device.Hostname) [$($hop.Device.DeviceType)]"
+                $details += " " * (73 - $hop.Device.Hostname.Length - $hop.Device.DeviceType.Length - 10) + "│`n"
+                $details += "└─────────────────────────────────────────────────────────────────────────────┘`n"
 
-                # Show entry interface (how traffic arrives at this device)
-                if ($hop.EntryInterface) {
-                    $details += "  --> ENTERS via: $($hop.EntryInterface)"
-                    if ($hop.EntryIP) {
-                        $details += " ($($hop.EntryIP))"
-                    }
-                    $details += "`n"
+                # Device capabilities summary
+                $capabilities = @()
+                if ($hop.Device.BGP_ASN -gt 0) { $capabilities += "BGP AS$($hop.Device.BGP_ASN)" }
+                if ($hop.Device.OSPFProcesses.Count -gt 0) { $capabilities += "OSPF" }
+                if ($hop.Device.Routes.Count -gt 0) { $capabilities += "$($hop.Device.Routes.Count) routes" }
+                if ($hop.Device.NATRules.Count -gt 0) { $capabilities += "NAT" }
+                if ($capabilities.Count -gt 0) {
+                    $details += "  Device Capabilities: $($capabilities -join ', ')`n`n"
                 }
 
-                $details += "  Current Source IP: $currentIP`n"
+                # INGRESS - Show how traffic arrives at this device
+                if ($hop.EntryInterface) {
+                    $details += "  ╭─[ INGRESS TRAFFIC ]────────────────────────────────────────────╮`n"
+                    $entryIface = $hop.Device.Interfaces[$hop.EntryInterface]
+                    $details += "  │ Traffic enters from previous hop via interface:                │`n"
+                    $details += "  │   Interface: $($hop.EntryInterface)"
+                    $details += " " * (57 - $hop.EntryInterface.Length) + "│`n"
+                    if ($hop.EntryIP) {
+                        $details += "  │   IP Address: $($hop.EntryIP)"
+                        if ($entryIface.SubnetMask) {
+                            $details += "/$($entryIface.CIDR)"
+                        }
+                        $details += " " * (56 - $hop.EntryIP.Length - $(if($entryIface.CIDR){$entryIface.CIDR.ToString().Length + 1}else{0})) + "│`n"
+                    }
+                    if ($entryIface -and $entryIface.Description) {
+                        $details += "  │   Description: $($entryIface.Description.Substring(0, [Math]::Min($entryIface.Description.Length, 45)))"
+                        $details += " " * (43 - [Math]::Min($entryIface.Description.Length, 45)) + "│`n"
+                    }
+                    if ($entryIface -and $entryIface.VRF -and $entryIface.VRF -ne "global") {
+                        $details += "  │   VRF: $($entryIface.VRF)"
+                        $details += " " * (58 - $entryIface.VRF.Length) + "│`n"
+                    }
+                    $details += "  │                                                                 │`n"
+                    $details += "  │ Packet Details:                                                 │`n"
+                    $details += "  │   Source IP: $currentIP"
+                    $details += " " * (51 - $currentIP.Length) + "│`n"
+                    $details += "  │   Destination IP: $destIP"
+                    $details += " " * (47 - $destIP.Length) + "│`n"
+                    $details += "  ╰─────────────────────────────────────────────────────────────────╯`n`n"
+                }
+                elseif ($hop.HopNumber -eq 1) {
+                    $details += "  ╭─[ TRAFFIC ORIGINATES HERE ]────────────────────────────────────╮`n"
+                    $details += "  │ This is the source device where the traffic begins             │`n"
+                    $details += "  │   Source IP: $currentIP"
+                    $details += " " * (51 - $currentIP.Length) + "│`n"
+                    $details += "  │   Destination IP: $destIP"
+                    $details += " " * (47 - $destIP.Length) + "│`n"
+                    $details += "  ╰─────────────────────────────────────────────────────────────────╯`n`n"
+                }
 
+                # ROUTING DECISION - Show routing logic
                 if ($hop.ExitInterface) {
-                    $details += "  [Routing] $($hop.Reason)`n"
+                    $details += "  ╭─[ ROUTING DECISION ]───────────────────────────────────────────╮`n"
+
+                    # Parse the Reason field to extract routing protocol and details
+                    $routingProto = "Unknown"
+                    $routeDetails = $hop.Reason
+
+                    if ($hop.Reason -match '\[Protocol: (\w+)') {
+                        $routingProto = $matches[1]
+                        $details += "  │ Routing Protocol: $routingProto"
+                        $details += " " * (49 - $routingProto.Length) + "│`n"
+                    }
+
+                    if ($hop.Reason -match 'AD: (\d+)') {
+                        $ad = $matches[1]
+                        $details += "  │ Administrative Distance: $ad"
+                        $details += " " * (39 - $ad.Length) + "│`n"
+                    }
+
+                    if ($hop.Reason -match 'Metric: (\d+)') {
+                        $metric = $matches[1]
+                        $details += "  │ Metric: $metric"
+                        $details += " " * (53 - $metric.Length) + "│`n"
+                    }
+
+                    if ($hop.Reason -match 'Route to ([^ ]+)') {
+                        $destSubnet = $matches[1]
+                        $details += "  │ Matched Route: $destSubnet"
+                        $details += " " * (45 - $destSubnet.Length) + "│`n"
+                    }
+
+                    if ($hop.Reason -match 'connected subnet' -or $routingProto -eq "Connected") {
+                        $details += "  │ Type: Directly Connected Subnet                                │`n"
+                    }
+                    elseif ($routingProto -eq "Static") {
+                        $details += "  │ Type: Static Route                                              │`n"
+                    }
+                    elseif ($routingProto -eq "BGP") {
+                        $details += "  │ Type: BGP Learned Route (Dynamic)                               │`n"
+                    }
+                    elseif ($routingProto -eq "OSPF") {
+                        $details += "  │ Type: OSPF Learned Route (Dynamic)                              │`n"
+                    }
 
                     if ($hop.NextHop) {
-                        $details += "  Next Hop: $($hop.NextHop)`n"
+                        $details += "  │                                                                 │`n"
+                        $details += "  │ Next Hop Gateway: $($hop.NextHop)"
+                        $details += " " * (44 - $hop.NextHop.Length) + "│`n"
+                        $details += "  │   (Traffic will be forwarded to this IP address)               │`n"
                     }
 
-                    # Show exit interface (how traffic leaves this device)
-                    $details += "  <-- EXITS via: $($hop.ExitInterface) ($($hop.ExitIP))"
-                    if ($hop.ExitVRF -and $hop.ExitVRF -ne "global") {
-                        $details += " [VRF: $($hop.ExitVRF)]"
+                    $details += "  ╰─────────────────────────────────────────────────────────────────╯`n`n"
+
+                    # EGRESS - Show how traffic leaves this device
+                    $details += "  ╭─[ EGRESS TRAFFIC ]─────────────────────────────────────────────╮`n"
+                    $exitIface = $hop.Device.Interfaces[$hop.ExitInterface]
+                    $details += "  │ Traffic exits to next hop via interface:                       │`n"
+                    $details += "  │   Interface: $($hop.ExitInterface)"
+                    $details += " " * (57 - $hop.ExitInterface.Length) + "│`n"
+                    $details += "  │   IP Address: $($hop.ExitIP)"
+                    if ($exitIface.SubnetMask) {
+                        $details += "/$($exitIface.CIDR)"
                     }
-                    $details += "`n"
+                    $details += " " * (56 - $hop.ExitIP.Length - $(if($exitIface.CIDR){$exitIface.CIDR.ToString().Length + 1}else{0})) + "│`n"
+                    if ($exitIface -and $exitIface.Description) {
+                        $details += "  │   Description: $($exitIface.Description.Substring(0, [Math]::Min($exitIface.Description.Length, 45)))"
+                        $details += " " * (43 - [Math]::Min($exitIface.Description.Length, 45)) + "│`n"
+                    }
+                    if ($exitIface -and $exitIface.VRF -and $exitIface.VRF -ne "global") {
+                        $details += "  │   VRF: $($exitIface.VRF)"
+                        $details += " " * (58 - $exitIface.VRF.Length) + "│`n"
+                    }
+                    $details += "  ╰─────────────────────────────────────────────────────────────────╯`n`n"
 
                     # Run comprehensive analysis for this hop
                     $device = $hop.Device
                     $outInterface = $device.Interfaces | Where-Object { $_.Name -eq $hop.ExitInterface } | Select-Object -First 1
+                    $hasAnalysis = $false
 
                     # Check for NAT translation
                     if ($outInterface -and $outInterface.NATOutside) {
                         $natResult = Apply-NATTranslation -Device $device -SourceIP $currentIP -Interface $hop.ExitInterface
                         if ($natResult.Translated) {
-                            $details += "  [NAT] $currentIP -> $($natResult.NewIP) ($($natResult.Type))`n"
+                            if (-not $hasAnalysis) {
+                                $details += "  ╭─[ PACKET ANALYSIS ]────────────────────────────────────────────╮`n"
+                                $hasAnalysis = $true
+                            }
+                            $details += "  │                                                                 │`n"
+                            $details += "  │ ⚠ NAT Translation Applied:                                     │`n"
+                            $details += "  │   Type: $($natResult.Type)"
+                            $details += " " * (57 - $natResult.Type.Length) + "│`n"
+                            $details += "  │   Original Source IP: $currentIP"
+                            $details += " " * (41 - $currentIP.Length) + "│`n"
+                            $details += "  │   Translated Source IP: $($natResult.NewIP)"
+                            $details += " " * (37 - $natResult.NewIP.Length) + "│`n"
+                            $details += "  │   (Packet source address changed for internet routing)         │`n"
                             $currentIP = $natResult.NewIP
                         }
                     }
@@ -2302,15 +2463,33 @@ function Show-NetworkMap {
                         $acl = $device.ACLs[$outInterface.ACL_Out]
                         if ($acl) {
                             $aclResult = Test-ACLMatch -ACL $acl -SourceIP $currentIP -DestIP $destIP
+                            if (-not $hasAnalysis) {
+                                $details += "  ╭─[ PACKET ANALYSIS ]────────────────────────────────────────────╮`n"
+                                $hasAnalysis = $true
+                            }
+                            $details += "  │                                                                 │`n"
                             if ($aclResult.Action -eq "deny") {
-                                $details += "  [ACL-DENY] Outbound ACL ($($acl.Name)): DENIED - $($aclResult.Reason)`n"
-                                $details += "`n  *** PATH BLOCKED AT THIS HOP ***`n"
-                                $details += "`n" + "=" * 80 + "`n"
+                                $details += "  │ ✗ ACL DENIED - Traffic Blocked!                                │`n"
+                                $details += "  │   ACL Name: $($acl.Name)"
+                                $details += " " * (55 - $acl.Name.Length) + "│`n"
+                                $details += "  │   Action: DENY                                                  │`n"
+                                $details += "  │   Reason: $($aclResult.Reason.Substring(0, [Math]::Min($aclResult.Reason.Length, 50)))"
+                                $details += " " * (49 - [Math]::Min($aclResult.Reason.Length, 50)) + "│`n"
+                                if ($hasAnalysis) {
+                                    $details += "  ╰─────────────────────────────────────────────────────────────────╯`n`n"
+                                }
+                                $details += "  ╔═════════════════════════════════════════════════════════════════╗`n"
+                                $details += "  ║ *** PATH BLOCKED AT THIS HOP ***                                ║`n"
+                                $details += "  ╚═════════════════════════════════════════════════════════════════╝`n`n"
+                                $details += "=" * 80 + "`n"
                                 $details += "RESULT: Traffic DENIED - path blocked by ACL/firewall`n"
                                 $detailsBox.Text = $details
                                 return
                             } else {
-                                $details += "  [ACL-PERMIT] Outbound ACL ($($acl.Name)): PERMITTED`n"
+                                $details += "  │ ✓ ACL Checked - Traffic Permitted                              │`n"
+                                $details += "  │   ACL Name: $($acl.Name)"
+                                $details += " " * (55 - $acl.Name.Length) + "│`n"
+                                $details += "  │   Action: PERMIT                                                │`n"
                             }
                         }
                     }
@@ -2319,33 +2498,32 @@ function Show-NetworkMap {
                     if ($outInterface -and $outInterface.ServicePolicy_Out) {
                         $qosResult = Get-QoSMarking -Device $device -PolicyMapName $outInterface.ServicePolicy_Out
                         if ($qosResult.Applied) {
-                            $details += "  [QoS] Policy $($qosResult.PolicyMap) applied`n"
+                            if (-not $hasAnalysis) {
+                                $details += "  ╭─[ PACKET ANALYSIS ]────────────────────────────────────────────╮`n"
+                                $hasAnalysis = $true
+                            }
+                            $details += "  │                                                                 │`n"
+                            $details += "  │ ⚙ QoS Policy Applied:                                          │`n"
+                            $details += "  │   Policy Map: $($qosResult.PolicyMap)"
+                            $details += " " * (53 - $qosResult.PolicyMap.Length) + "│`n"
+                            $details += "  │   (Traffic may be marked, shaped, or prioritized)              │`n"
                         }
                     }
 
-                    # Display BGP info
-                    if ($device.BGP_ASN) {
-                        $neighborCount = ($device.BGPNeighbors | Where-Object { $_.VRF -eq $hop.VRF }).Count
-                        if ($neighborCount -gt 0) {
-                            $details += "  [BGP] AS$($device.BGP_ASN) configured ($neighborCount neighbors)`n"
-                        }
-                    }
-
-                    # Display OSPF info
-                    if ($device.OSPFProcesses.Count -gt 0) {
-                        $ospfProcs = ($device.OSPFProcesses.Values | Where-Object { $_.VRF -eq $hop.VRF -or ($_.VRF -eq "global" -and $hop.VRF -eq "global") })
-                        if ($ospfProcs.Count -gt 0) {
-                            $procIDs = ($ospfProcs | ForEach-Object { $_.ProcessID }) -join ", "
-                            $details += "  [OSPF] Process(es): $procIDs`n"
-                        }
+                    if ($hasAnalysis) {
+                        $details += "  ╰─────────────────────────────────────────────────────────────────╯`n`n"
                     }
                 }
 
                 if ($hop.Error) {
-                    $details += "  ERROR: $($hop.Error)`n"
-                    $details += "`n  *** PATH CANNOT CONTINUE ***`n"
-                    $details += "`n" + "=" * 80 + "`n"
-                    $details += "RESULT: Path FAILED - $($hop.Error)`n"
+                    $details += "`n"
+                    $details += "  ╔═════════════════════════════════════════════════════════════════╗`n"
+                    $details += "  ║ *** PATH FAILED - CANNOT CONTINUE ***                           ║`n"
+                    $details += "  ╚═════════════════════════════════════════════════════════════════╝`n"
+                    $details += "  Error: $($hop.Error)`n`n"
+                    $details += "=" * 80 + "`n"
+                    $details += "RESULT: Path FAILED`n"
+                    $details += "Reason: $($hop.Error)`n"
                     $detailsBox.Text = $details
                     return
                 }
@@ -2353,11 +2531,41 @@ function Show-NetworkMap {
                 $details += "`n"
             }
 
+            # Final summary
+            $details += "╔═══════════════════════════════════════════════════════════════════════════════╗`n"
+            $details += "║                           PATH TRACE COMPLETE                                 ║`n"
+            $details += "╚═══════════════════════════════════════════════════════════════════════════════╝`n`n"
+            $details += "RESULT: ✓ Path is VALID - traffic would be forwarded successfully`n`n"
+
+            $details += "PATH STATISTICS:`n"
+            $details += "  Total Hops:           $($routingPath.Count)`n"
+            $details += "  Routing Method:       Table-based forwarding (longest prefix match)`n"
+
+            # Count routing protocols used
+            $protoCount = @{}
+            foreach ($hop in $routingPath) {
+                if ($hop.Reason -match '\[Protocol: (\w+)') {
+                    $proto = $matches[1]
+                    if (-not $protoCount.ContainsKey($proto)) {
+                        $protoCount[$proto] = 0
+                    }
+                    $protoCount[$proto]++
+                }
+            }
+            if ($protoCount.Count -gt 0) {
+                $details += "  Protocols Used:       $($protoCount.Keys -join ', ')`n"
+            }
+
+            # Count NAT/ACL/QoS applications
+            $natApplied = ($routingPath | Where-Object { $_.ExitInterface -and ($_.Device.NATRules.Count -gt 0) }).Count
+            $aclChecked = ($routingPath | Where-Object { $_.ExitInterface }).Count
+
+            if ($natApplied -gt 0) {
+                $details += "  NAT Translations:     $natApplied hop(s)`n"
+            }
+            $details += "  Security Checks:      $aclChecked interface(s) checked`n"
+            $details += "`n"
             $details += "=" * 80 + "`n"
-            $details += "RESULT: Path is VALID - traffic would be forwarded successfully`n"
-            $details += "`nPATH STATISTICS:`n"
-            $details += "  Total Hops: $($routingPath.Count)`n"
-            $details += "  Routing Decision: Based on routing tables (longest prefix match)`n"
 
             $detailsBox.Text = $details
 
