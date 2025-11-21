@@ -906,16 +906,149 @@ function Build-NetworkTopology {
 
 function Calculate-Layout {
     param([System.Collections.ArrayList]$Devices, [array]$Connections)
-    
-    # Simple circular layout
-    $centerX = 400
-    $centerY = 300
-    $radius = 200
-    
-    for ($i = 0; $i -lt $Devices.Count; $i++) {
-        $angle = ($i / $Devices.Count) * 2 * [Math]::PI
-        $Devices[$i].X = $centerX + ($radius * [Math]::Cos($angle))
-        $Devices[$i].Y = $centerY + ($radius * [Math]::Sin($angle))
+
+    # Hierarchical layout based on network topology layers
+    # Analyzes connection patterns to determine device hierarchy
+
+    if ($Devices.Count -eq 0) { return }
+
+    # Calculate connection count for each device (degree centrality)
+    $deviceConnections = @{}
+    foreach ($device in $Devices) {
+        $deviceConnections[$device.Hostname] = 0
+    }
+
+    foreach ($conn in $Connections) {
+        $deviceConnections[$conn.Device1.Hostname]++
+        $deviceConnections[$conn.Device2.Hostname]++
+    }
+
+    # Assign devices to layers based on connection count and device type
+    # Layer 0 (Core): Highest connectivity, typically routers/core switches
+    # Layer 1 (Distribution): Medium connectivity
+    # Layer 2 (Access): Lower connectivity, access switches, endpoints
+
+    $layers = @{
+        0 = [System.Collections.ArrayList]@()  # Core
+        1 = [System.Collections.ArrayList]@()  # Distribution
+        2 = [System.Collections.ArrayList]@()  # Access
+    }
+
+    # Calculate average connections
+    $avgConnections = ($deviceConnections.Values | Measure-Object -Average).Average
+
+    foreach ($device in $Devices) {
+        $connCount = $deviceConnections[$device.Hostname]
+
+        # Core layer: High connectivity (above average + 1) OR explicitly core devices
+        if ($connCount -gt ($avgConnections + 1) -or
+            $device.Hostname -match "(?i)(core|backbone|wan|isp|internet|mpls|transit)" -or
+            $device.Type -eq "Core Router") {
+            [void]$layers[0].Add($device)
+        }
+        # Access layer: Low connectivity (1-2 connections) OR explicitly access devices
+        elseif ($connCount -le 2 -or
+                $device.Hostname -match "(?i)(access|branch|remote|client|pc|host|workstation)" -or
+                $device.Type -match "(?i)(access|endpoint|host)") {
+            [void]$layers[2].Add($device)
+        }
+        # Distribution layer: Everything else (medium connectivity)
+        else {
+            [void]$layers[1].Add($device)
+        }
+    }
+
+    # If all devices ended up in one layer, redistribute them
+    if ($layers[0].Count -eq 0 -and $layers[1].Count -eq 0) {
+        # All in access - move highest connectivity to core
+        $sorted = $Devices | Sort-Object { $deviceConnections[$_.Hostname] } -Descending
+        for ($i = 0; $i -lt [Math]::Min(2, $Devices.Count); $i++) {
+            [void]$layers[0].Add($sorted[$i])
+            $layers[2].Remove($sorted[$i])
+        }
+    }
+
+    # Canvas dimensions
+    $canvasWidth = 800
+    $canvasHeight = 600
+    $marginX = 100
+    $marginY = 80
+
+    # Calculate Y positions for each layer
+    $layerY = @{
+        0 = $marginY                                    # Core at top
+        1 = $canvasHeight / 2                           # Distribution in middle
+        2 = $canvasHeight - $marginY                    # Access at bottom
+    }
+
+    # Position devices within each layer
+    foreach ($layerNum in 0..2) {
+        $devicesInLayer = $layers[$layerNum]
+        if ($devicesInLayer.Count -eq 0) { continue }
+
+        $y = $layerY[$layerNum]
+
+        if ($devicesInLayer.Count -eq 1) {
+            # Single device - center it
+            $devicesInLayer[0].X = $canvasWidth / 2
+            $devicesInLayer[0].Y = $y
+        }
+        else {
+            # Multiple devices - spread horizontally
+            $availableWidth = $canvasWidth - (2 * $marginX)
+            $spacing = $availableWidth / ($devicesInLayer.Count - 1)
+
+            for ($i = 0; $i -lt $devicesInLayer.Count; $i++) {
+                $devicesInLayer[$i].X = $marginX + ($i * $spacing)
+                $devicesInLayer[$i].Y = $y
+            }
+        }
+    }
+
+    # Apply force-directed refinement to reduce line crossings (5 iterations)
+    # This gently adjusts positions while maintaining layer structure
+    for ($iteration = 0; $iteration -lt 5; $iteration++) {
+        foreach ($device in $Devices) {
+            $forceX = 0
+
+            # Get connected devices
+            $neighbors = @()
+            foreach ($conn in $Connections) {
+                if ($conn.Device1.Hostname -eq $device.Hostname) {
+                    $neighbors += $conn.Device2
+                }
+                elseif ($conn.Device2.Hostname -eq $device.Hostname) {
+                    $neighbors += $conn.Device1
+                }
+            }
+
+            # Spring force: pull toward connected neighbors (X axis only)
+            foreach ($neighbor in $neighbors) {
+                $dx = $neighbor.X - $device.X
+                $distance = [Math]::Abs($dx)
+                if ($distance -gt 0) {
+                    $forceX += ($dx / $distance) * [Math]::Min($distance / 50, 2)
+                }
+            }
+
+            # Repulsion force: push away from non-connected devices in same layer
+            foreach ($other in $Devices) {
+                if ($other.Hostname -eq $device.Hostname) { continue }
+                if ([Math]::Abs($other.Y - $device.Y) -gt 50) { continue }  # Different layer
+
+                $dx = $device.X - $other.X
+                $distance = [Math]::Abs($dx)
+                if ($distance -gt 0 -and $distance -lt 150) {
+                    $forceX += ($dx / $distance) * (150 - $distance) / 30
+                }
+            }
+
+            # Apply force (small movement per iteration)
+            $device.X += $forceX * 0.3
+
+            # Keep within canvas bounds
+            $device.X = [Math]::Max($marginX, [Math]::Min($canvasWidth - $marginX, $device.X))
+        }
     }
 }
 
