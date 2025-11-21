@@ -189,8 +189,8 @@ class OSPFProcess {
     [hashtable]$Networks = @{}  # Network -> Area
     [System.Collections.ArrayList]$PassiveInterfaces = @()
 
-    OSPFProcess([int]$pid) {
-        $this.ProcessID = $pid
+    OSPFProcess([int]$processId) {
+        $this.ProcessID = $processId
     }
 }
 
