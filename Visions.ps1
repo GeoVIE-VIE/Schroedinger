@@ -920,7 +920,10 @@ function Build-NetworkTopology {
 
     Write-Host "  Building topology from interface subnets..." -ForegroundColor Cyan
     Write-Host "    Analyzing devices for connectivity..." -ForegroundColor Gray
+    Write-Host "" -ForegroundColor Gray
 
+    # First pass: collect all interface details for debugging
+    $allInterfaces = @()
     foreach ($device in $Devices) {
         $deviceHasConnections = $false
         $interfacesWithIP = 0
@@ -930,6 +933,18 @@ function Build-NetworkTopology {
             # Count interfaces with IPs
             if ($iface.IPAddress) {
                 $interfacesWithIP++
+
+                # Track all interfaces for detailed output
+                $allInterfaces += @{
+                    Device = $device.Hostname
+                    Interface = $iface.Name
+                    IP = $iface.IPAddress
+                    Mask = $iface.SubnetMask
+                    Network = $iface.Network
+                    CIDR = $iface.CIDR
+                    VRF = $iface.VRF
+                    HasSubnet = ($iface.Network -and $iface.SubnetMask)
+                }
             }
 
             # Skip interfaces without IP addresses or network calculation
@@ -970,6 +985,26 @@ function Build-NetworkTopology {
                 Write-Host "    WARNING: $($device.Hostname) has $interfacesWithIP interface(s) with IPs but ALL are missing subnet masks" -ForegroundColor Yellow
             }
         }
+    }
+
+    # Show detailed interface inventory if any interfaces found
+    if ($allInterfaces.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Interface Inventory (for connectivity troubleshooting):" -ForegroundColor Cyan
+        $validCount = ($allInterfaces | Where-Object { $_.HasSubnet }).Count
+        $invalidCount = ($allInterfaces | Where-Object { -not $_.HasSubnet }).Count
+        Write-Host "    Total interfaces with IPs: $($allInterfaces.Count)" -ForegroundColor Gray
+        Write-Host "    Valid (with subnet): $validCount" -ForegroundColor Green
+        Write-Host "    Invalid (missing subnet): $invalidCount" -ForegroundColor Yellow
+
+        if ($invalidCount -gt 0) {
+            Write-Host ""
+            Write-Host "    Interfaces missing subnet masks (will NOT be connected):" -ForegroundColor Yellow
+            foreach ($iface in ($allInterfaces | Where-Object { -not $_.HasSubnet })) {
+                Write-Host "      $($iface.Device) - $($iface.Interface) - $($iface.IP)" -ForegroundColor DarkYellow
+            }
+        }
+        Write-Host ""
     }
 
     # Now find connections only within same VRF+subnet (much faster!)
@@ -2431,6 +2466,75 @@ function Show-NetworkMap {
                         $details += " " * (58 - $exitIface.VRF.Length) + "|`n"
                     }
                     $details += "  +" + ("-" * 65) + "+`n`n"
+
+                    # Show device-to-device traversal (if not the last hop)
+                    if ($hop.HopNumber -lt $routingPath.Count) {
+                        $nextHop = $routingPath[$hop.HopNumber]  # Next hop in array (HopNumber is 1-based)
+
+                        $details += "  +- DEVICE-TO-DEVICE TRAVERSAL " + ("-" * 34) + "+`n"
+                        $details += "  |                                                                 |`n"
+                        $details += "  | Traffic Flow:                                                   |`n"
+                        $details += "  |   FROM: $($hop.Device.Hostname)"
+                        $details += " " * (56 - $hop.Device.Hostname.Length) + "|`n"
+                        $details += "  |     Exit Interface: $($hop.ExitInterface) ($($hop.ExitIP))"
+                        $details += " " * (35 - $hop.ExitInterface.Length - $hop.ExitIP.Length) + "|`n"
+
+                        # Find the physical connection
+                        $connection = $null
+                        foreach ($conn in $Connections) {
+                            if (($conn.Device1.Hostname -eq $hop.Device.Hostname -and $conn.Interface1 -eq $hop.ExitInterface) -or
+                                ($conn.Device2.Hostname -eq $hop.Device.Hostname -and $conn.Interface2 -eq $hop.ExitInterface)) {
+                                $connection = $conn
+                                break
+                            }
+                        }
+
+                        if ($connection) {
+                            # Determine the subnet they share
+                            $exitIface = $hop.Device.Interfaces[$hop.ExitInterface]
+                            if ($exitIface -and $exitIface.Network -and $exitIface.CIDR) {
+                                $details += "  |                                                                 |`n"
+                                $details += "  |   === Physical Link ===                                         |`n"
+                                $details += "  |   Shared Subnet: $($exitIface.Network)/$($exitIface.CIDR)"
+                                $details += " " * (41 - $exitIface.Network.Length - $exitIface.CIDR.ToString().Length) + "|`n"
+
+                                if ($exitIface.VRF -and $exitIface.VRF -ne "global") {
+                                    $details += "  |   VRF: $($exitIface.VRF)"
+                                    $details += " " * (58 - $exitIface.VRF.Length) + "|`n"
+                                }
+
+                                $details += "  |   Connection Type: Layer 3 (Routed)                            |`n"
+                            }
+                        }
+
+                        $details += "  |                                                                 |`n"
+                        $details += "  |   TO: $($nextHop.Device.Hostname)"
+                        $details += " " * (58 - $nextHop.Device.Hostname.Length) + "|`n"
+
+                        if ($nextHop.EntryInterface) {
+                            $details += "  |     Entry Interface: $($nextHop.EntryInterface)"
+                            if ($nextHop.EntryIP) {
+                                $details += " ($($nextHop.EntryIP))"
+                            }
+                            $entryLen = $nextHop.EntryInterface.Length + $(if($nextHop.EntryIP){$nextHop.EntryIP.Length + 3}else{0})
+                            $details += " " * (43 - $entryLen) + "|`n"
+                        }
+
+                        $details += "  |                                                                 |`n"
+                        $details += "  | Routing Decision:                                               |`n"
+                        $details += "  |   Next hop gateway $($hop.NextHop) is reachable via"
+                        $details += " " * (24 - $hop.NextHop.Length) + "|`n"
+                        $details += "  |   the shared subnet on $($hop.ExitInterface)"
+                        $details += " " * (42 - $hop.ExitInterface.Length) + "|`n"
+                        $details += "  |                                                                 |`n"
+                        $details += "  | Result: Packet forwarded from $($hop.Device.Hostname) to $($nextHop.Device.Hostname)"
+                        $totalLen = $hop.Device.Hostname.Length + $nextHop.Device.Hostname.Length + 36
+                        if ($totalLen -lt 65) {
+                            $details += " " * (65 - $totalLen)
+                        }
+                        $details += "|`n"
+                        $details += "  +" + ("-" * 65) + "+`n`n"
+                    }
 
                     # Run comprehensive analysis for this hop
                     $device = $hop.Device
