@@ -1,0 +1,539 @@
+!======================================================================
+! GLOBAL SYSTEM / MGMT / SECURITY
+!======================================================================
+version 17.9
+service timestamps debug datetime msec localtime show-timezone
+service timestamps log datetime msec localtime show-timezone
+service password-encryption
+no service pad
+no ip domain-lookup
+
+hostname C8500-BR1
+ip domain-name lab.example
+
+!---------------------------------------------------
+! AAA / TACACS+ / LOCAL FALLBACK
+!---------------------------------------------------
+aaa new-model
+aaa authentication login default group tacacs+ local
+aaa authentication enable default group tacacs+ enable
+aaa authorization exec default group tacacs+ local if-authenticated
+aaa accounting exec default start-stop group tacacs+
+aaa accounting commands 15 default start-stop group tacacs+
+
+tacacs server TACACS1
+ address ipv4 192.0.2.50
+ key TACACS_KEY_SUPER_SECURE
+
+ip tacacs source-interface GigabitEthernet0/0/0
+
+username admin privilege 15 secret 0 AdminP@ss123
+
+enable secret 0 Enabl3P@ss
+
+!---------------------------------------------------
+! SSH / VTY
+!---------------------------------------------------
+crypto key generate rsa modulus 2048 label SSH-KEY
+ip ssh version 2
+ip ssh time-out 60
+ip ssh authentication-retries 3
+
+ip access-list standard VTY-MGMT
+ permit 192.0.2.0 0.0.0.255
+ deny any log
+
+line vty 0 4
+ login authentication default
+ transport input ssh
+ access-class VTY-MGMT in
+ exec-timeout 10 0
+
+!---------------------------------------------------
+! NTP / LOGGING
+!---------------------------------------------------
+ntp server 192.0.2.20 prefer
+ntp update-calendar
+
+logging buffered 16384 informational
+logging host 192.0.2.30
+logging trap warnings
+
+!---------------------------------------------------
+! SNMPv3 – secure
+!---------------------------------------------------
+snmp-server group NOC v3 priv
+snmp-server user noc NOC v3 auth sha N0cAuthP@ss priv aes 256 N0cPrivP@ss
+snmp-server host 192.0.2.40 version 3 priv noc
+snmp-server location BR1-RACK-A
+snmp-server contact noc@lab.example
+
+!======================================================================
+! VRFs
+!======================================================================
+vrf definition MGMT
+ description Out-of-band management
+ address-family ipv4
+ exit-address-family
+
+vrf definition TRANSIT-MPLS
+ description MPLS transport VRF
+ address-family ipv4
+ exit-address-family
+
+vrf definition TRANSIT-INET
+ description Internet DIA transport VRF
+ address-family ipv4
+ exit-address-family
+
+vrf definition TRANSIT-LTE
+ description LTE/5G transport VRF
+ address-family ipv4
+ exit-address-family
+
+vrf definition CORP
+ description Corporate LAN VRF
+ address-family ipv4
+ exit-address-family
+
+vrf definition GUEST
+ description Guest LAN VRF
+ address-family ipv4
+ exit-address-family
+
+!======================================================================
+! LOOPBACKS
+!======================================================================
+interface Loopback0
+ description Global Router-ID
+ ip address 10.255.255.1 255.255.255.255
+
+interface Loopback100
+ description CORP summarization loopback
+ vrf forwarding CORP
+ ip address 10.10.100.1 255.255.255.255
+
+!======================================================================
+! MANAGEMENT INTERFACE
+!======================================================================
+interface GigabitEthernet0/0/0
+ description OOB Management
+ vrf forwarding MGMT
+ ip address 192.0.2.10 255.255.255.0
+ no shutdown
+
+ip route vrf MGMT 0.0.0.0 0.0.0.0 192.0.2.1 name MGMT-DEFAULT
+
+!======================================================================
+! WAN / TRANSPORT INTERFACES (3-LINK REDUNDANCY)
+!======================================================================
+
+!------------------------- MPLS --------------------
+interface TenGigabitEthernet1/0/0
+ description WAN-MPLS -> MPLS PE1
+ vrf forwarding TRANSIT-MPLS
+ ip address 172.16.0.2 255.255.255.252   ! PE is 172.16.0.1
+ no ip redirects
+ no ip proxy-arp
+ ip verify unicast source reachable-via rx
+ no shutdown
+
+!------------------------- INET (DIA) --------------
+interface TenGigabitEthernet1/0/1
+ description WAN-INET -> ISP DIA
+ vrf forwarding TRANSIT-INET
+ ip address 203.0.113.2 255.255.255.252  ! ISP is 203.0.113.1
+ no ip redirects
+ no ip proxy-arp
+ ip verify unicast source reachable-via rx
+ no shutdown
+
+!------------------------- LTE / 5G ----------------
+interface GigabitEthernet0/0/1
+ description WAN-LTE -> 4G/5G CPE
+ vrf forwarding TRANSIT-LTE
+ ip address 198.51.100.2 255.255.255.252 ! CPE is 198.51.100.1
+ no ip redirects
+ no ip proxy-arp
+ ip verify unicast source reachable-via rx
+ no shutdown
+
+! Default routes in transport VRFs
+ip route vrf TRANSIT-INET 0.0.0.0 0.0.0.0 203.0.113.1 name INET-DEFAULT
+ip route vrf TRANSIT-LTE  0.0.0.0 0.0.0.0 198.51.100.1 200 name LTE-DEFAULT
+
+!======================================================================
+! LAN INTERFACES – CORP / GUEST
+!======================================================================
+
+interface TenGigabitEthernet2/0/0
+ description CORP-LAN-TRUSTED
+ vrf forwarding CORP
+ ip address 10.10.10.1 255.255.255.0
+ ip ospf 10 area 0
+ no shutdown
+
+interface TenGigabitEthernet2/0/1
+ description GUEST-LAN-UNTRUSTED
+ vrf forwarding GUEST
+ ip address 10.20.20.1 255.255.255.0
+ ip ospf 20 area 0
+ no shutdown
+
+!======================================================================
+! MPLS WAN – BGP PEERING WITH SP (eBGP in TRANSIT-MPLS)
+!======================================================================
+
+router bgp 65001
+ bgp router-id 10.255.255.1
+ bgp log-neighbor-changes
+ no bgp default ipv4-unicast
+
+!----------- MPLS Provider eBGP (VRF TRANSIT-MPLS) ----------
+! PE address: 172.16.0.1, SP AS: 64500
+ neighbor MPLS-PE peer-group
+ neighbor MPLS-PE remote-as 64500
+ neighbor MPLS-PE description MPLS Provider Edge
+ neighbor MPLS-PE timers 10 30 30
+ neighbor MPLS-PE fall-over bfd
+
+ address-family ipv4 vrf TRANSIT-MPLS
+  neighbor 172.16.0.1 peer-group MPLS-PE
+  neighbor 172.16.0.1 activate
+  neighbor 172.16.0.1 send-community both
+  neighbor 172.16.0.1 route-map MPLS-OUT out
+  neighbor 172.16.0.1 route-map MPLS-IN  in
+ exit-address-family
+
+!----------- SD-WAN / FlexVPN BGP to DC Hubs (Global VRF) ---
+! We run BGP over Tunnel10 / Tunnel11 to DCs in AS 65010
+
+neighbor SDWAN-DC peer-group
+neighbor SDWAN-DC remote-as 65010
+neighbor SDWAN-DC description SD-WAN DC overlay
+neighbor SDWAN-DC timers 10 30 30
+neighbor SDWAN-DC fall-over bfd
+
+address-family ipv4
+ ! Hub1 via Tunnel10
+ neighbor 10.0.10.1 peer-group SDWAN-DC
+ neighbor 10.0.10.1 activate
+ neighbor 10.0.10.1 send-community both
+ neighbor 10.0.10.1 weight 200        ! Prefer Hub1
+
+ ! Hub2 via Tunnel11 (LTE backup / secondary)
+ neighbor 10.0.11.1 peer-group SDWAN-DC
+ neighbor 10.0.11.1 activate
+ neighbor 10.0.11.1 send-community both
+ neighbor 10.0.11.1 weight 50         ! Less preferred
+
+ ! Advertise summarized branch prefixes
+ network 10.10.0.0 mask 255.255.0.0
+ network 10.20.0.0 mask 255.255.0.0
+
+ ! Redistribute OSPF from CORP/GUEST into overlay
+ redistribute ospf 10 route-map OSPF-CORP-TO-SDWAN
+ redistribute ospf 20 route-map OSPF-GUEST-TO-SDWAN
+exit-address-family
+
+!----------- BGP VRF CORP / GUEST (to MPLS VPN / DC) -----------
+address-family ipv4 vrf CORP
+ ! Routes to MPLS L3VPN / DC imported by policy at DC/PE
+ redistribute ospf 10 route-map OSPF-CORP-TO-BGP
+exit-address-family
+
+address-family ipv4 vrf GUEST
+ redistribute ospf 20 route-map OSPF-GUEST-TO-BGP
+exit-address-family
+
+!======================================================================
+! OSPF – INSIDE ROUTING
+!======================================================================
+
+router ospf 10 vrf CORP
+ router-id 10.10.100.1
+ passive-interface default
+ no passive-interface TenGigabitEthernet2/0/0
+ network 10.10.10.0 0.0.0.255 area 0
+ network 10.10.100.1 0.0.0.0 area 0
+
+router ospf 20 vrf GUEST
+ router-id 10.20.20.1
+ passive-interface default
+ no passive-interface TenGigabitEthernet2/0/1
+ network 10.20.20.0 0.0.0.255 area 0
+
+!======================================================================
+! FLEXVPN / SD-WAN-LIKE OVERLAY (INET + LTE)
+!======================================================================
+
+!------------------------- IKEv2 --------------------
+crypto ikev2 proposal IKEV2-PROP
+ encryption aes-cbc-256
+ integrity sha256
+ group 16
+
+crypto ikev2 policy IKEV2-POLICY
+ proposal IKEV2-PROP
+
+crypto ikev2 keyring HUBS
+ peer HUB1
+  address 203.0.113.10
+  pre-shared-key local BR1-HUB1-KEY
+  pre-shared-key remote HUB1-BR1-KEY
+ peer HUB2
+  address 198.51.100.10
+  pre-shared-key local BR1-HUB2-KEY
+  pre-shared-key remote HUB2-BR1-KEY
+
+crypto ikev2 profile IKEV2-FLEXVPN
+ match identity remote address 203.0.113.10 255.255.255.255
+ match identity remote address 198.51.100.10 255.255.255.255
+ identity local address 0.0.0.0
+ authentication local pre-share
+ authentication remote pre-share
+ keyring local HUBS
+ dpd 10 3 on-demand
+
+!------------------------- IPsec / Transform Set -----
+crypto ipsec transform-set IPSEC-TS esp-aes 256 esp-sha256-hmac
+ mode tunnel
+
+crypto ipsec profile IPSEC-FLEXVPN
+ set transform-set IPSEC-TS
+ set ikev2-profile IKEV2-FLEXVPN
+
+!------------------------- Virtual-Template for FlexVPN
+interface Virtual-Template10 type tunnel
+ description FlexVPN template for SD-WAN overlays
+ ip unnumbered Loopback0
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile IPSEC-FLEXVPN
+
+!------------------------- Overlay Tunnels -----------
+interface Tunnel10
+ description SDWAN-HUB1 over INET
+ ip unnumbered Loopback0
+ tunnel source TenGigabitEthernet1/0/1
+ tunnel destination 203.0.113.10
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile IPSEC-FLEXVPN
+ ip tcp adjust-mss 1350
+ ip mtu 1400
+ no shutdown
+
+interface Tunnel11
+ description SDWAN-HUB2 over LTE
+ ip unnumbered Loopback0
+ tunnel source GigabitEthernet0/0/1
+ tunnel destination 198.51.100.10
+ tunnel mode ipsec ipv4
+ tunnel protection ipsec profile IPSEC-FLEXVPN
+ ip tcp adjust-mss 1350
+ ip mtu 1400
+ no shutdown
+
+!------------------------- BFD for overlay -----------
+bfd-template single-hop SDWAN-BFD
+ interval min-tx 50 min-rx 50 multiplier 3
+
+interface Tunnel10
+ bfd template SDWAN-BFD
+
+interface Tunnel11
+ bfd template SDWAN-BFD
+
+!======================================================================
+! IP SLA + TRACKING FOR PREFERRED OVERLAY PATH
+!======================================================================
+
+ip sla 10
+ vrf TRANSIT-INET
+ icmp-echo 203.0.113.10 source-ip 203.0.113.2
+ frequency 5
+ip sla schedule 10 life forever start-time now
+
+ip sla 11
+ vrf TRANSIT-LTE
+ icmp-echo 198.51.100.10 source-ip 198.51.100.2
+ frequency 5
+ip sla schedule 11 life forever start-time now
+
+track 10 ip sla 10 reachability
+track 11 ip sla 11 reachability
+
+! Default route for global VRF pointing into MPLS / SD-WAN (example)
+ip route 0.0.0.0 0.0.0.0 Tunnel10 track 10
+ip route 0.0.0.0 0.0.0.0 Tunnel11 200 track 11
+
+!======================================================================
+! ROUTE-MAPS / FILTERS / COMMUNITIES (POLICY)
+!======================================================================
+
+ip prefix-list CORP-SUMMARY seq 5 permit 10.10.0.0/16 le 24
+ip prefix-list GUEST-SUMMARY seq 5 permit 10.20.0.0/16 le 24
+
+ip prefix-list MPLS-REMOTE-DEFAULT seq 5 permit 0.0.0.0/0
+
+route-map MPLS-OUT permit 10
+ match ip address prefix-list CORP-SUMMARY
+ set local-preference 150
+ set community 64500:100 additive
+route-map MPLS-OUT permit 20
+ match ip address prefix-list GUEST-SUMMARY
+ set local-preference 100
+ set community 64500:200 additive
+
+route-map MPLS-IN permit 10
+ match ip address prefix-list MPLS-REMOTE-DEFAULT
+ set local-preference 80
+
+route-map OSPF-CORP-TO-BGP permit 10
+ match ip address prefix-list CORP-SUMMARY
+ set metric 10
+ set community 65001:100 additive
+
+route-map OSPF-GUEST-TO-BGP permit 10
+ match ip address prefix-list GUEST-SUMMARY
+ set metric 20
+ set community 65001:200 additive
+
+route-map OSPF-CORP-TO-SDWAN permit 10
+ match ip address prefix-list CORP-SUMMARY
+ set metric 5
+ set local-preference 200
+ set community 65001:110 additive
+
+route-map OSPF-GUEST-TO-SDWAN permit 10
+ match ip address prefix-list GUEST-SUMMARY
+ set metric 5
+ set local-preference 150
+ set community 65001:210 additive
+
+!======================================================================
+! QOS – SIMPLE WAN EDGE POLICY (LLQ + CBWFQ)
+!======================================================================
+
+class-map match-any CM-VOICE
+ match dscp ef
+
+class-map match-any CM-Critical
+ match dscp af31 af41
+
+class-map match-any CM-Bulk
+ match dscp af11 af12 af13
+
+policy-map PM-WAN-OUT
+ class CM-VOICE
+  priority percent 20
+  set dscp ef
+ class CM-Critical
+  bandwidth percent 40
+  set dscp af31
+ class CM-Bulk
+  bandwidth percent 20
+  set dscp af11
+ class class-default
+  fair-queue
+
+! Apply QoS to all WAN physical egress
+interface TenGigabitEthernet1/0/0
+ service-policy output PM-WAN-OUT
+
+interface TenGigabitEthernet1/0/1
+ service-policy output PM-WAN-OUT
+
+interface GigabitEthernet0/0/1
+ service-policy output PM-WAN-OUT
+
+!======================================================================
+! ZONE-BASED FIREWALL (SKELETON) – INSIDE vs WAN vs MGMT
+!======================================================================
+
+zone security Z-IN
+zone security Z-WAN
+zone security Z-MGMT
+
+! Class-map for traffic of interest
+class-map type inspect match-any CM-IN-to-WAN
+ match protocol tcp
+ match protocol udp
+ match protocol icmp
+
+policy-map type inspect PM-IN-to-WAN
+ class type inspect CM-IN-to-WAN
+  inspect
+ class class-default
+  drop log
+
+policy-map type inspect PM-WAN-to-IN
+ class type inspect CM-IN-to-WAN
+  inspect
+ class class-default
+  drop log
+
+zone-pair security ZP-IN-WAN source Z-IN destination Z-WAN
+ service-policy type inspect PM-IN-to-WAN
+
+zone-pair security ZP-WAN-IN source Z-WAN destination Z-IN
+ service-policy type inspect PM-WAN-to-IN
+
+! Assign interfaces to zones
+interface TenGigabitEthernet2/0/0
+ zone-member security Z-IN
+
+interface TenGigabitEthernet2/0/1
+ zone-member security Z-IN
+
+interface TenGigabitEthernet1/0/0
+ zone-member security Z-WAN
+
+interface TenGigabitEthernet1/0/1
+ zone-member security Z-WAN
+
+interface GigabitEthernet0/0/1
+ zone-member security Z-WAN
+
+interface GigabitEthernet0/0/0
+ zone-member security Z-MGMT
+
+!======================================================================
+! CONTROL PLANE POLICING (BASIC)
+!======================================================================
+
+ip access-list extended CP-ACL-MGMT
+ permit tcp 192.0.2.0 0.0.0.255 host 192.0.2.10 eq 22
+ permit udp 192.0.2.0 0.0.0.255 host 192.0.2.10 eq 161
+ deny   ip any any log
+
+class-map match-any CM-CP-MGMT
+ match access-group name CP-ACL-MGMT
+
+class-map match-any CM-CP-ROUTING
+ match protocol ospf
+ match protocol bgp
+ match protocol icmp
+
+policy-map PM-CP
+ class CM-CP-MGMT
+  police 512000 conform-action transmit exceed-action drop
+ class CM-CP-ROUTING
+  police 2048000 conform-action transmit exceed-action drop
+ class class-default
+  police 1024000 conform-action transmit exceed-action drop
+
+control-plane
+ service-policy input PM-CP
+
+!======================================================================
+! MISC / HOUSEKEEPING
+!======================================================================
+ip cef
+ipv6 unicast-routing
+
+! Logging of critical messages
+banner motd ^C
+*** Authorized access only. All activity is monitored and logged. ***
+^C
+
+end
