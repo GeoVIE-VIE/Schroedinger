@@ -968,13 +968,13 @@ function Calculate-Layout {
         }
     }
 
-    # Canvas dimensions
-    $canvasWidth = 800
-    $canvasHeight = 600
-    $marginX = 100
-    $marginY = 80
+    # Canvas dimensions - much larger to accommodate hundreds of devices
+    $canvasWidth = 3000
+    $canvasHeight = 2000
+    $marginX = 150
+    $marginY = 150
 
-    # Calculate Y positions for each layer
+    # Calculate Y positions for each layer with more vertical spacing
     $layerY = @{
         0 = $marginY                                    # Core at top
         1 = $canvasHeight / 2                           # Distribution in middle
@@ -1032,14 +1032,16 @@ function Calculate-Layout {
             }
 
             # Repulsion force: push away from non-connected devices in same layer
+            # Increased minimum distance for better visibility with many devices
             foreach ($other in $Devices) {
                 if ($other.Hostname -eq $device.Hostname) { continue }
                 if ([Math]::Abs($other.Y - $device.Y) -gt 50) { continue }  # Different layer
 
                 $dx = $device.X - $other.X
                 $distance = [Math]::Abs($dx)
-                if ($distance -gt 0 -and $distance -lt 150) {
-                    $forceX += ($dx / $distance) * (150 - $distance) / 30
+                $minDistance = 250  # Minimum spacing between devices
+                if ($distance -gt 0 -and $distance -lt $minDistance) {
+                    $forceX += ($dx / $distance) * ($minDistance - $distance) / 30
                 }
             }
 
@@ -1491,12 +1493,28 @@ function Show-NetworkMap {
                 <Label Content="Dest IP:" VerticalAlignment="Center" Margin="10,0,0,0" Width="70"/>
                 <TextBox Name="DestIPBox" Width="120" Margin="5,0,0,0" Text="10.20.20.100" VerticalContentAlignment="Center"/>
             </StackPanel>
+            <!-- Fourth row: Zoom and view controls -->
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,5">
+                <Label Content="Zoom:" VerticalAlignment="Center" Width="100"/>
+                <Button Name="ZoomInButton" Content="+" Width="30" Margin="5,0,2,0" Padding="5" FontWeight="Bold"/>
+                <Button Name="ZoomOutButton" Content="-" Width="30" Margin="2,0,2,0" Padding="5" FontWeight="Bold"/>
+                <Button Name="ZoomResetButton" Content="Reset" Width="50" Margin="2,0,5,0" Padding="5"/>
+                <Label Name="ZoomLabel" Content="100%" VerticalAlignment="Center" Width="50" Margin="5,0,0,0"/>
+                <Label Content="(Use mouse wheel or drag to pan)" VerticalAlignment="Center" Margin="20,0,0,0" Foreground="Gray" FontStyle="Italic"/>
+            </StackPanel>
         </StackPanel>
         
         <!-- Canvas for network diagram -->
         <Border Grid.Row="1" BorderBrush="#CCCCCC" BorderThickness="1" Margin="5">
-            <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
-                <Canvas Name="NetworkCanvas" Background="White" Width="800" Height="600"/>
+            <ScrollViewer Name="CanvasScroller" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+                <Canvas Name="NetworkCanvas" Background="White" Width="3000" Height="2000">
+                    <Canvas.RenderTransform>
+                        <TransformGroup>
+                            <ScaleTransform x:Name="CanvasScale"/>
+                            <TranslateTransform x:Name="CanvasTranslate"/>
+                        </TransformGroup>
+                    </Canvas.RenderTransform>
+                </Canvas>
             </ScrollViewer>
         </Border>
         
@@ -1527,6 +1545,7 @@ function Show-NetworkMap {
     
     # Get controls
     $canvas = $window.FindName("NetworkCanvas")
+    $canvasScroller = $window.FindName("CanvasScroller")
     $sourceCombo = $window.FindName("SourceCombo")
     $destCombo = $window.FindName("DestCombo")
     $sourceInterfaceCombo = $window.FindName("SourceInterfaceCombo")
@@ -1537,6 +1556,21 @@ function Show-NetworkMap {
     $traceButton = $window.FindName("TraceButton")
     $clearButton = $window.FindName("ClearButton")
     $detailsBox = $window.FindName("DetailsBox")
+    $zoomInButton = $window.FindName("ZoomInButton")
+    $zoomOutButton = $window.FindName("ZoomOutButton")
+    $zoomResetButton = $window.FindName("ZoomResetButton")
+    $zoomLabel = $window.FindName("ZoomLabel")
+
+    # Get canvas transform for zoom/pan
+    $canvasTransform = $canvas.RenderTransform
+    $canvasScale = $canvasTransform.Children[0]
+    $canvasTranslate = $canvasTransform.Children[1]
+
+    # Zoom level tracking
+    $script:zoomLevel = 1.0
+    $script:zoomMin = 0.1
+    $script:zoomMax = 3.0
+    $script:zoomStep = 0.1
 
     # Populate device combo boxes
     foreach ($device in $Devices) {
@@ -1627,6 +1661,83 @@ function Show-NetworkMap {
                     $destIPBox.Text = $ifaceIP
                 }
             }
+        }
+    })
+
+    # Zoom helper function
+    function Set-Zoom {
+        param([double]$newZoom)
+
+        $script:zoomLevel = [Math]::Max($script:zoomMin, [Math]::Min($script:zoomMax, $newZoom))
+        $canvasScale.ScaleX = $script:zoomLevel
+        $canvasScale.ScaleY = $script:zoomLevel
+        $zoomLabel.Content = "$([Math]::Round($script:zoomLevel * 100))%"
+
+        # Update canvas size based on zoom
+        $canvas.Width = 3000 * $script:zoomLevel
+        $canvas.Height = 2000 * $script:zoomLevel
+    }
+
+    # Zoom button event handlers
+    $zoomInButton.Add_Click({
+        Set-Zoom ($script:zoomLevel + $script:zoomStep)
+    })
+
+    $zoomOutButton.Add_Click({
+        Set-Zoom ($script:zoomLevel - $script:zoomStep)
+    })
+
+    $zoomResetButton.Add_Click({
+        Set-Zoom 1.0
+        $canvasTranslate.X = 0
+        $canvasTranslate.Y = 0
+    })
+
+    # Mouse wheel zoom support
+    $canvas.Add_MouseWheel({
+        param($sender, $e)
+
+        if ($e.Delta -gt 0) {
+            # Zoom in
+            Set-Zoom ($script:zoomLevel + $script:zoomStep)
+        } else {
+            # Zoom out
+            Set-Zoom ($script:zoomLevel - $script:zoomStep)
+        }
+        $e.Handled = $true
+    })
+
+    # Canvas panning support (drag to pan)
+    $script:isPanning = $false
+    $script:panStartPoint = $null
+
+    $canvas.Add_MouseLeftButtonDown({
+        param($sender, $e)
+        $script:isPanning = $true
+        $script:panStartPoint = $e.GetPosition($canvasScroller)
+        $canvas.CaptureMouse()
+        $e.Handled = $true
+    })
+
+    $canvas.Add_MouseLeftButtonUp({
+        param($sender, $e)
+        $script:isPanning = $false
+        $canvas.ReleaseMouseCapture()
+        $e.Handled = $true
+    })
+
+    $canvas.Add_MouseMove({
+        param($sender, $e)
+        if ($script:isPanning -and $script:panStartPoint) {
+            $currentPoint = $e.GetPosition($canvasScroller)
+            $deltaX = $currentPoint.X - $script:panStartPoint.X
+            $deltaY = $currentPoint.Y - $script:panStartPoint.Y
+
+            $canvasScroller.ScrollToHorizontalOffset($canvasScroller.HorizontalOffset - $deltaX)
+            $canvasScroller.ScrollToVerticalOffset($canvasScroller.VerticalOffset - $deltaY)
+
+            $script:panStartPoint = $currentPoint
+            $e.Handled = $true
         }
     })
 
