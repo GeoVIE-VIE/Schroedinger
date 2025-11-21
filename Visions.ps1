@@ -277,13 +277,9 @@ function Parse-CiscoConfig {
             $device.Interfaces[$ifaceName] = $currentInterface
 
             # Determine device type from interfaces (tentative - may be overridden later)
-            if ($ifaceName -match '^(TenGigabitEthernet|GigabitEthernet|FastEthernet|Ethernet)') {
-                if ($device.DeviceType -eq "Unknown") {
-                    $device.DeviceType = "Router"  # Tentative
-                }
-            }
+            # Note: Don't assume physical interfaces = router, both routers and switches have them
             if ($ifaceName -match '^Vlan') {
-                # Could be L3 switch - don't override if already Router
+                # Vlan interfaces indicate a switch (tentative)
                 if ($device.DeviceType -eq "Unknown") {
                     $device.DeviceType = "Switch"
                 }
@@ -591,8 +587,9 @@ function Parse-CiscoConfig {
     # Final device type determination based on routing capabilities
     # This overrides tentative interface-based detection
     $routingScore = 0
+    $switchScore = 0
 
-    # Check for routing protocols
+    # Check for routing protocols (STRONG router indicators)
     if ($device.BGP_ASN -gt 0) { $routingScore += 10 }  # BGP = strong indicator
     if ($device.OSPFProcesses.Count -gt 0) { $routingScore += 10 }  # OSPF = strong indicator
 
@@ -608,36 +605,47 @@ function Parse-CiscoConfig {
     if ($vrfCount -ge 1) { $routingScore += 5 }  # VRFs = routing feature
     if ($vrfCount -ge 3) { $routingScore += 5 }  # Many VRFs = enterprise router
 
-    # Check for static routes (basic routing)
-    if ($device.Routes.Count -gt 0) { $routingScore += 3 }
-
-    # Check for tunnel interfaces (VPN/MPLS)
+    # Check for tunnel interfaces (VPN/MPLS) - strong router indicator
     $hasTunnels = $false
     foreach ($iface in $device.Interfaces.Values) {
         if ($iface.Name -match '^Tunnel') {
             $hasTunnels = $true
+            $routingScore += 8
             break
         }
     }
-    if ($hasTunnels) { $routingScore += 5 }
 
     # Check for NAT (router feature)
     if ($device.NATRules.Count -gt 0) { $routingScore += 3 }
 
-    # Check for ACLs (common on routers)
-    if ($device.ACLs.Count -gt 0) { $routingScore += 1 }
+    # Check for static routes (weak indicator - L3 switches also have routes)
+    if ($device.Routes.Count -gt 5) { $routingScore += 2 }  # Only count if many routes
 
-    # Determine final device type based on routing score
-    # Score >= 10: Definitely a router (has routing protocols)
-    # Score >= 5: Likely a router (has routing features)
-    # Score < 5: Keep interface-based detection
+    # Count Vlan interfaces (STRONG switch indicator)
+    $vlanCount = 0
+    foreach ($iface in $device.Interfaces.Values) {
+        if ($iface.Name -match '^Vlan') {
+            $vlanCount++
+        }
+    }
+    if ($vlanCount -ge 5) { $switchScore += 10 }  # Many Vlans = definitely a switch
+    elseif ($vlanCount -ge 2) { $switchScore += 5 }  # Some Vlans = likely a switch
+
+    # Determine final device type
+    # Priority: Routing protocols > Switch indicators > Tentative detection
     if ($routingScore -ge 10) {
+        # Has routing protocols (BGP/OSPF) = definitely a router
         $device.DeviceType = "Router"
     }
-    elseif ($routingScore -ge 5 -and $device.DeviceType -eq "Switch") {
-        # L3 switch with significant routing - call it a router
+    elseif ($switchScore -ge 10 -and $routingScore -lt 10) {
+        # Many Vlans and no routing protocols = definitely a switch
+        $device.DeviceType = "Switch"
+    }
+    elseif ($routingScore -ge 8 -and $device.DeviceType -ne "Switch") {
+        # Has tunnels or strong routing features = router
         $device.DeviceType = "Router"
     }
+    # Otherwise: keep tentative interface-based detection
 
     return $device
 }
