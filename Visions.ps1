@@ -907,86 +907,127 @@ function Build-NetworkTopology {
 function Calculate-Layout {
     param([System.Collections.ArrayList]$Devices, [array]$Connections)
 
-    # Hierarchical layout based on network topology layers
-    # Analyzes connection patterns to determine device hierarchy
+    # Tree-based hierarchical layout that respects network architecture
+    # Routers at top, switches/devices connected to routers below them
 
     if ($Devices.Count -eq 0) { return }
 
-    # Calculate connection count for each device (degree centrality)
-    $deviceConnections = @{}
-    foreach ($device in $Devices) {
-        $deviceConnections[$device.Hostname] = 0
-    }
-
-    foreach ($conn in $Connections) {
-        $deviceConnections[$conn.Device1.Hostname]++
-        $deviceConnections[$conn.Device2.Hostname]++
-    }
-
-    # Assign devices to layers based on connection count and device type
-    # Layer 0 (Core): Highest connectivity, typically routers/core switches
-    # Layer 1 (Distribution): Medium connectivity
-    # Layer 2 (Access): Lower connectivity, access switches, endpoints
-
-    $layers = @{
-        0 = [System.Collections.ArrayList]@()  # Core
-        1 = [System.Collections.ArrayList]@()  # Distribution
-        2 = [System.Collections.ArrayList]@()  # Access
-    }
-
-    # Calculate average connections
-    $avgConnections = ($deviceConnections.Values | Measure-Object -Average).Average
-
-    foreach ($device in $Devices) {
-        $connCount = $deviceConnections[$device.Hostname]
-
-        # Core layer: High connectivity (above average + 1) OR explicitly core devices
-        if ($connCount -gt ($avgConnections + 1) -or
-            $device.Hostname -match "(?i)(core|backbone|wan|isp|internet|mpls|transit)" -or
-            $device.Type -eq "Core Router") {
-            [void]$layers[0].Add($device)
-        }
-        # Access layer: Low connectivity (1-2 connections) OR explicitly access devices
-        elseif ($connCount -le 2 -or
-                $device.Hostname -match "(?i)(access|branch|remote|client|pc|host|workstation)" -or
-                $device.Type -match "(?i)(access|endpoint|host)") {
-            [void]$layers[2].Add($device)
-        }
-        # Distribution layer: Everything else (medium connectivity)
-        else {
-            [void]$layers[1].Add($device)
-        }
-    }
-
-    # If all devices ended up in one layer, redistribute them
-    if ($layers[0].Count -eq 0 -and $layers[1].Count -eq 0) {
-        # All in access - move highest connectivity to core
-        $sorted = $Devices | Sort-Object { $deviceConnections[$_.Hostname] } -Descending
-        for ($i = 0; $i -lt [Math]::Min(2, $Devices.Count); $i++) {
-            [void]$layers[0].Add($sorted[$i])
-            $layers[2].Remove($sorted[$i])
-        }
-    }
-
-    # Canvas dimensions - much larger to accommodate hundreds of devices
+    # Canvas dimensions
     $canvasWidth = 3000
     $canvasHeight = 2000
     $marginX = 150
-    $marginY = 150
+    $marginY = 200
+    $verticalSpacing = 350  # Space between layers
 
-    # Calculate Y positions for each layer with more vertical spacing
-    $layerY = @{
-        0 = $marginY                                    # Core at top
-        1 = $canvasHeight / 2                           # Distribution in middle
-        2 = $canvasHeight - $marginY                    # Access at bottom
+    # Build adjacency list for faster lookups
+    $adjacency = @{}
+    foreach ($device in $Devices) {
+        $adjacency[$device.Hostname] = @()
+    }
+    foreach ($conn in $Connections) {
+        $adjacency[$conn.Device1.Hostname] += $conn.Device2
+        $adjacency[$conn.Device2.Hostname] += $conn.Device1
     }
 
-    # Position devices within each layer
-    foreach ($layerNum in 0..2) {
-        $devicesInLayer = $layers[$layerNum]
-        if ($devicesInLayer.Count -eq 0) { continue }
+    # Find root devices (core/WAN routers with routing protocols or high connectivity)
+    $roots = @()
+    $connectionCount = @{}
+    foreach ($device in $Devices) {
+        $connectionCount[$device.Hostname] = $adjacency[$device.Hostname].Count
+    }
 
-        $y = $layerY[$layerNum]
+    $maxConnections = ($connectionCount.Values | Measure-Object -Maximum).Maximum
+
+    foreach ($device in $Devices) {
+        $isRoot = $false
+
+        # Root criteria (in priority order):
+        # 1. Has routing protocols (BGP/OSPF)
+        if ($device.BGP_ASN -gt 0 -or $device.OSPFProcesses.Count -gt 0) {
+            $isRoot = $true
+        }
+        # 2. Named as core/WAN/ISP/Internet
+        elseif ($device.Hostname -match "(?i)(core|wan|isp|internet|backbone|mpls|transit|gateway)") {
+            $isRoot = $true
+        }
+        # 3. Router with high connectivity (>= 80% of max)
+        elseif ($device.DeviceType -eq "Router" -and $connectionCount[$device.Hostname] -ge ($maxConnections * 0.8)) {
+            $isRoot = $true
+        }
+
+        if ($isRoot) {
+            $roots += $device
+        }
+    }
+
+    # If no roots found, pick highest connectivity routers
+    if ($roots.Count -eq 0) {
+        $routers = $Devices | Where-Object { $_.DeviceType -eq "Router" }
+        if ($routers.Count -gt 0) {
+            $roots = $routers | Sort-Object { $connectionCount[$_.Hostname] } -Descending | Select-Object -First ([Math]::Max(1, [Math]::Ceiling($routers.Count / 3)))
+        } else {
+            # No routers, pick highest connectivity devices
+            $roots = $Devices | Sort-Object { $connectionCount[$_.Hostname] } -Descending | Select-Object -First ([Math]::Max(1, [Math]::Ceiling($Devices.Count / 4)))
+        }
+    }
+
+    # Assign layers using BFS from roots
+    $deviceLayers = @{}
+    $visited = @{}
+    $queue = New-Object System.Collections.Queue
+
+    # Start with roots at layer 0
+    foreach ($root in $roots) {
+        $deviceLayers[$root.Hostname] = 0
+        $visited[$root.Hostname] = $true
+        $queue.Enqueue($root.Hostname)
+    }
+
+    # BFS to assign layers based on distance from roots
+    while ($queue.Count -gt 0) {
+        $currentName = $queue.Dequeue()
+        $currentLayer = $deviceLayers[$currentName]
+
+        foreach ($neighbor in $adjacency[$currentName]) {
+            if (-not $visited[$neighbor.Hostname]) {
+                $visited[$neighbor.Hostname] = $true
+                $deviceLayers[$neighbor.Hostname] = $currentLayer + 1
+                $queue.Enqueue($neighbor.Hostname)
+            }
+        }
+    }
+
+    # Handle disconnected devices (assign to bottom layer)
+    $maxLayer = 0
+    if ($deviceLayers.Count -gt 0) {
+        $maxLayer = ($deviceLayers.Values | Measure-Object -Maximum).Maximum
+    }
+    foreach ($device in $Devices) {
+        if (-not $deviceLayers.ContainsKey($device.Hostname)) {
+            $deviceLayers[$device.Hostname] = $maxLayer + 1
+        }
+    }
+
+    # Group devices by layer
+    $layers = @{}
+    foreach ($device in $Devices) {
+        $layer = $deviceLayers[$device.Hostname]
+        if (-not $layers.ContainsKey($layer)) {
+            $layers[$layer] = @()
+        }
+        $layers[$layer] += $device
+    }
+
+    # Position devices layer by layer
+    $layerNumbers = $layers.Keys | Sort-Object
+    foreach ($layerNum in $layerNumbers) {
+        $devicesInLayer = $layers[$layerNum]
+        $y = $marginY + ($layerNum * $verticalSpacing)
+
+        # Limit Y to canvas bounds
+        if ($y -gt $canvasHeight - $marginY) {
+            $y = $canvasHeight - $marginY
+        }
 
         if ($devicesInLayer.Count -eq 1) {
             # Single device - center it
@@ -995,58 +1036,86 @@ function Calculate-Layout {
         }
         else {
             # Multiple devices - spread horizontally
+            # Group by parent router if possible
             $availableWidth = $canvasWidth - (2 * $marginX)
             $spacing = $availableWidth / ($devicesInLayer.Count - 1)
 
-            for ($i = 0; $i -lt $devicesInLayer.Count; $i++) {
-                $devicesInLayer[$i].X = $marginX + ($i * $spacing)
-                $devicesInLayer[$i].Y = $y
+            # Try to position devices near their parents (devices in layer above)
+            if ($layerNum -gt 0 -and $layers.ContainsKey($layerNum - 1)) {
+                $parents = $layers[$layerNum - 1]
+                $positioned = @{}
+
+                # Position devices under their connected parent
+                foreach ($device in $devicesInLayer) {
+                    $parent = $null
+                    foreach ($neighbor in $adjacency[$device.Hostname]) {
+                        if ($deviceLayers[$neighbor.Hostname] -eq ($layerNum - 1)) {
+                            $parent = $neighbor
+                            break
+                        }
+                    }
+
+                    if ($parent) {
+                        # Position near parent's X coordinate
+                        $device.X = $parent.X
+                        $device.Y = $y
+                        $positioned[$device.Hostname] = $true
+                    }
+                }
+
+                # Position remaining devices
+                $unpositioned = $devicesInLayer | Where-Object { -not $positioned.ContainsKey($_.Hostname) }
+                $startX = $marginX
+                foreach ($device in $unpositioned) {
+                    $device.X = $startX
+                    $device.Y = $y
+                    $startX += $spacing
+                }
+            }
+            else {
+                # First layer or no parent layer - spread evenly
+                for ($i = 0; $i -lt $devicesInLayer.Count; $i++) {
+                    $devicesInLayer[$i].X = $marginX + ($i * $spacing)
+                    $devicesInLayer[$i].Y = $y
+                }
             }
         }
     }
 
-    # Apply force-directed refinement to reduce line crossings (5 iterations)
-    # This gently adjusts positions while maintaining layer structure
-    for ($iteration = 0; $iteration -lt 5; $iteration++) {
+    # Apply force-directed refinement (gentler, fewer iterations)
+    for ($iteration = 0; $iteration -lt 3; $iteration++) {
         foreach ($device in $Devices) {
             $forceX = 0
-
-            # Get connected devices
-            $neighbors = @()
-            foreach ($conn in $Connections) {
-                if ($conn.Device1.Hostname -eq $device.Hostname) {
-                    $neighbors += $conn.Device2
-                }
-                elseif ($conn.Device2.Hostname -eq $device.Hostname) {
-                    $neighbors += $conn.Device1
-                }
-            }
+            $myLayer = $deviceLayers[$device.Hostname]
 
             # Spring force: pull toward connected neighbors (X axis only)
-            foreach ($neighbor in $neighbors) {
-                $dx = $neighbor.X - $device.X
-                $distance = [Math]::Abs($dx)
-                if ($distance -gt 0) {
-                    $forceX += ($dx / $distance) * [Math]::Min($distance / 50, 2)
+            foreach ($neighbor in $adjacency[$device.Hostname]) {
+                $neighborLayer = $deviceLayers[$neighbor.Hostname]
+                # Only apply force for devices in same or adjacent layers
+                if ([Math]::Abs($neighborLayer - $myLayer) -le 1) {
+                    $dx = $neighbor.X - $device.X
+                    $distance = [Math]::Abs($dx)
+                    if ($distance -gt 0) {
+                        $forceX += ($dx / $distance) * [Math]::Min($distance / 100, 1)
+                    }
                 }
             }
 
-            # Repulsion force: push away from non-connected devices in same layer
-            # Increased minimum distance for better visibility with many devices
+            # Repulsion force: push away from devices in same layer
             foreach ($other in $Devices) {
                 if ($other.Hostname -eq $device.Hostname) { continue }
-                if ([Math]::Abs($other.Y - $device.Y) -gt 50) { continue }  # Different layer
+                if ($deviceLayers[$other.Hostname] -ne $myLayer) { continue }
 
                 $dx = $device.X - $other.X
                 $distance = [Math]::Abs($dx)
-                $minDistance = 250  # Minimum spacing between devices
+                $minDistance = 250
                 if ($distance -gt 0 -and $distance -lt $minDistance) {
-                    $forceX += ($dx / $distance) * ($minDistance - $distance) / 30
+                    $forceX += ($dx / $distance) * ($minDistance - $distance) / 40
                 }
             }
 
-            # Apply force (small movement per iteration)
-            $device.X += $forceX * 0.3
+            # Apply force (small movement)
+            $device.X += $forceX * 0.2
 
             # Keep within canvas bounds
             $device.X = [Math]::Max($marginX, [Math]::Min($canvasWidth - $marginX, $device.X))
@@ -1229,6 +1298,7 @@ function Find-RoutingPath {
     $currentIP = $SourceIP
     $hopCount = 0
     $visitedDevices = @{}
+    $previousExitInterface = $null  # Track exit interface from previous hop
 
     while ($hopCount -lt $MaxHops) {
         $hopCount++
@@ -1237,6 +1307,33 @@ function Find-RoutingPath {
         $pathHop = @{
             Device = $currentDevice
             HopNumber = $hopCount
+        }
+
+        # Determine entry interface (where traffic arrives from previous hop)
+        if ($hopCount -gt 1 -and $previousExitInterface) {
+            # Find the connection and get the interface on current device
+            foreach ($conn in $Connections) {
+                if ($conn.Device1.Hostname -eq $path[$path.Count - 1].Device.Hostname -and
+                    $conn.Interface1 -eq $previousExitInterface -and
+                    $conn.Device2.Hostname -eq $currentDevice.Hostname) {
+                    $pathHop.EntryInterface = $conn.Interface2
+                    $entryIface = $currentDevice.Interfaces[$conn.Interface2]
+                    if ($entryIface) {
+                        $pathHop.EntryIP = $entryIface.IPAddress
+                    }
+                    break
+                }
+                elseif ($conn.Device2.Hostname -eq $path[$path.Count - 1].Device.Hostname -and
+                        $conn.Interface2 -eq $previousExitInterface -and
+                        $conn.Device1.Hostname -eq $currentDevice.Hostname) {
+                    $pathHop.EntryInterface = $conn.Interface1
+                    $entryIface = $currentDevice.Interfaces[$conn.Interface1]
+                    if ($entryIface) {
+                        $pathHop.EntryIP = $entryIface.IPAddress
+                    }
+                    break
+                }
+            }
         }
 
         # Check if we've reached destination device
@@ -1312,6 +1409,9 @@ function Find-RoutingPath {
         $pathHop.ExitVRF = $exitInterface.VRF
         $pathHop.NextHop = $nextHopIP
         $path += $pathHop
+
+        # Store exit interface for next hop's entry interface tracking
+        $previousExitInterface = $exitInterface.Name
 
         # Find next device via connection
         $nextDevice = $null
@@ -1932,20 +2032,32 @@ function Show-NetworkMap {
 
             $currentIP = $sourceIP
             foreach ($hop in $routingPath) {
-                $details += "Hop $($hop.HopNumber): $($hop.Device.Hostname) ($($hop.Device.Type))`n"
+                $details += "Hop $($hop.HopNumber): $($hop.Device.Hostname) ($($hop.Device.DeviceType))`n"
+
+                # Show entry interface (how traffic arrives at this device)
+                if ($hop.EntryInterface) {
+                    $details += "  --> ENTERS via: $($hop.EntryInterface)"
+                    if ($hop.EntryIP) {
+                        $details += " ($($hop.EntryIP))"
+                    }
+                    $details += "`n"
+                }
+
                 $details += "  Current Source IP: $currentIP`n"
 
                 if ($hop.ExitInterface) {
-                    $details += "  Exit Interface: $($hop.ExitInterface) ($($hop.ExitIP))"
-                    if ($hop.VRF -ne "global") {
-                        $details += " [VRF: $($hop.VRF)]"
-                    }
-                    $details += "`n"
                     $details += "  [Routing] $($hop.Reason)`n"
 
                     if ($hop.NextHop) {
                         $details += "  Next Hop: $($hop.NextHop)`n"
                     }
+
+                    # Show exit interface (how traffic leaves this device)
+                    $details += "  <-- EXITS via: $($hop.ExitInterface) ($($hop.ExitIP))"
+                    if ($hop.ExitVRF -and $hop.ExitVRF -ne "global") {
+                        $details += " [VRF: $($hop.ExitVRF)]"
+                    }
+                    $details += "`n"
 
                     # Run comprehensive analysis for this hop
                     $device = $hop.Device
