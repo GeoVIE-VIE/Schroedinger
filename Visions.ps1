@@ -81,9 +81,12 @@ class NetworkDevice {
     [hashtable]$QoSClassMaps = @{}  # Name -> QoSClassMap
     [hashtable]$QoSPolicyMaps = @{}  # Name -> QoSPolicyMap
     [System.Collections.ArrayList]$BGPNeighbors = @()
+    [hashtable]$BGPNetworks = @{}  # Network/CIDR -> VRF (BGP originated routes)
     [hashtable]$OSPFProcesses = @{}  # ProcessID -> OSPFProcess
     [int]$BGP_ASN = 0
     [string]$BGP_RouterID
+    [bool]$BGPRedistributeConnected = $false
+    [bool]$BGPRedistributeStatic = $false
 
     NetworkDevice([string]$hostname) {
         $this.Hostname = $hostname
@@ -239,6 +242,8 @@ function Parse-CiscoConfig {
     $rxBGP = [regex]'^router bgp\s+(\d+)'
     $rxBGPRouterID = [regex]'^\s*bgp router-id\s+(\d+\.\d+\.\d+\.\d+)'
     $rxBGPNeighbor = [regex]'^\s*neighbor\s+(\d+\.\d+\.\d+\.\d+)\s+remote-as\s+(\d+)'
+    $rxBGPNetwork = [regex]'^\s*network\s+(\d+\.\d+\.\d+\.\d+)(?:\s+mask\s+(\d+\.\d+\.\d+\.\d+))?'
+    $rxBGPRedistribute = [regex]'^\s*redistribute\s+(connected|static|ospf|rip)'
 
     # OSPF patterns
     $rxOSPFProcess = [regex]'^router ospf\s+(\d+)(?:\s+vrf\s+(\S+))?'
@@ -534,6 +539,38 @@ function Parse-CiscoConfig {
             }
         }
 
+        # Parse BGP network statements
+        if ($currentBGP) {
+            $m = $rxBGPNetwork.Match($line)
+            if ($m.Success) {
+                $networkIP = $m.Groups[1].Value
+                $networkMask = if ($m.Groups[2].Success) { $m.Groups[2].Value } else { "255.255.255.0" }  # Default Class C if no mask
+
+                # Calculate network address and CIDR
+                $networkAddr = Get-NetworkAddress -IP $networkIP -Mask $networkMask
+                $cidr = ConvertTo-CIDR -SubnetMask $networkMask
+                $networkKey = "$networkAddr/$cidr"
+
+                $device.BGPNetworks[$networkKey] = $currentBGPVRF
+                continue
+            }
+        }
+
+        # Parse BGP redistribute statements
+        if ($currentBGP) {
+            $m = $rxBGPRedistribute.Match($line)
+            if ($m.Success) {
+                $redistributeType = $m.Groups[1].Value
+                if ($redistributeType -eq "connected") {
+                    $device.BGPRedistributeConnected = $true
+                }
+                elseif ($redistributeType -eq "static") {
+                    $device.BGPRedistributeStatic = $true
+                }
+                continue
+            }
+        }
+
         # Parse OSPF process
         $m = $rxOSPFProcess.Match($line)
         if ($m.Success) {
@@ -652,10 +689,24 @@ function Parse-CiscoConfig {
 
 function ConvertTo-CIDR {
     param([string]$SubnetMask)
-    
+
     $octets = $SubnetMask -split '\.'
     $binary = ($octets | ForEach-Object { [Convert]::ToString([int]$_, 2).PadLeft(8, '0') }) -join ''
     return ($binary.ToCharArray() | Where-Object { $_ -eq '1' }).Count
+}
+
+function ConvertFrom-CIDR {
+    param([int]$CIDR)
+
+    # Create binary string with $CIDR number of 1s followed by 0s
+    $binary = ('1' * $CIDR).PadRight(32, '0')
+
+    # Convert to 4 octets
+    $octets = for ($i = 0; $i -lt 32; $i += 8) {
+        [Convert]::ToInt32($binary.Substring($i, 8), 2)
+    }
+
+    return $octets -join '.'
 }
 
 function Get-NetworkAddress {
@@ -821,7 +872,8 @@ function Get-QoSMarking {
 function Build-RoutingTable {
     param(
         [NetworkDevice]$Device,
-        [string]$VRF = "global"
+        [string]$VRF = "global",
+        [System.Collections.ArrayList]$AllDevices = $null
     )
 
     $routingTable = @()
@@ -853,22 +905,142 @@ function Build-RoutingTable {
     }
 
     # Add BGP routes (Admin Distance = 20 for eBGP, 200 for iBGP)
-    # For WAN connectivity, add default routes learned via BGP
-    if ($Device.BGPNeighbors.Count -gt 0) {
+    if ($Device.BGP_ASN -gt 0) {
+        # 1. Add locally originated BGP network statements
+        foreach ($networkKey in $Device.BGPNetworks.Keys) {
+            $networkVRF = $Device.BGPNetworks[$networkKey]
+            if ($networkVRF -eq $VRF) {
+                # Parse network/cidr
+                if ($networkKey -match '^(.+)/(\d+)$') {
+                    $network = $matches[1]
+                    $cidr = [int]$matches[2]
+
+                    # Calculate mask from CIDR
+                    $mask = ConvertFrom-CIDR -CIDR $cidr
+
+                    # Find which interface this network is on (if connected)
+                    $exitIface = $null
+                    foreach ($iface in $Device.Interfaces.Values) {
+                        if ($iface.Network -eq $network -and $iface.CIDR -eq $cidr) {
+                            $exitIface = $iface.Name
+                            break
+                        }
+                    }
+
+                    # Add as local BGP originated route (AD = 200 for locally originated)
+                    $routingTable += @{
+                        Destination = $network
+                        Mask = $mask
+                        NextHop = "Local"
+                        Metric = 0
+                        AdminDistance = 200
+                        Protocol = "BGP-Local"
+                        ExitInterface = $exitIface
+                    }
+                }
+            }
+        }
+
+        # 2. Add BGP-redistributed connected routes
+        if ($Device.BGPRedistributeConnected) {
+            # Already added as connected routes above, but mark them as BGP candidates
+        }
+
+        # 3. Add routes learned from BGP neighbors (including iBGP)
         foreach ($neighbor in $Device.BGPNeighbors) {
             if ($neighbor.VRF -eq $VRF -or ($neighbor.VRF -eq "global" -and $VRF -eq "global")) {
-                # Determine admin distance (eBGP = 20, iBGP = 200)
-                $adminDistance = if ($neighbor.RemoteAS -ne $Device.BGP_ASN) { 20 } else { 200 }
+                # Determine if eBGP or iBGP
+                $isIBGP = ($neighbor.RemoteAS -eq $Device.BGP_ASN)
+                $adminDistance = if ($isIBGP) { 200 } else { 20 }
 
-                # Add default route via BGP neighbor (common in WAN scenarios)
-                $routingTable += @{
-                    Destination = "0.0.0.0"
-                    Mask = "0.0.0.0"
-                    NextHop = $neighbor.IPAddress
-                    Metric = 0
-                    AdminDistance = $adminDistance
-                    Protocol = "BGP"
-                    ExitInterface = $null  # Will be determined by next hop lookup
+                # For eBGP: Add default route (common WAN scenario)
+                if (-not $isIBGP) {
+                    $routingTable += @{
+                        Destination = "0.0.0.0"
+                        Mask = "0.0.0.0"
+                        NextHop = $neighbor.IPAddress
+                        Metric = 0
+                        AdminDistance = $adminDistance
+                        Protocol = "eBGP"
+                        ExitInterface = $null  # Will be determined by next hop lookup
+                    }
+                }
+
+                # For iBGP: Learn routes from peer's BGP networks
+                if ($isIBGP -and $AllDevices) {
+                    # Find the iBGP peer device
+                    foreach ($peerDevice in $AllDevices) {
+                        if ($peerDevice.BGP_ASN -eq $neighbor.RemoteAS) {
+                            # Check if this device has the neighbor IP
+                            $isPeer = $false
+                            foreach ($iface in $peerDevice.Interfaces.Values) {
+                                if ($iface.IPAddress -eq $neighbor.IPAddress) {
+                                    $isPeer = $true
+                                    break
+                                }
+                            }
+
+                            if ($isPeer) {
+                                # Learn all BGP networks from this iBGP peer
+                                foreach ($peerNetworkKey in $peerDevice.BGPNetworks.Keys) {
+                                    $peerVRF = $peerDevice.BGPNetworks[$peerNetworkKey]
+                                    if ($peerVRF -eq $VRF) {
+                                        # Parse network/cidr
+                                        if ($peerNetworkKey -match '^(.+)/(\d+)$') {
+                                            $network = $matches[1]
+                                            $cidr = [int]$matches[2]
+                                            $mask = ConvertFrom-CIDR -CIDR $cidr
+
+                                            # Add as iBGP-learned route
+                                            $routingTable += @{
+                                                Destination = $network
+                                                Mask = $mask
+                                                NextHop = $neighbor.IPAddress
+                                                Metric = 0
+                                                AdminDistance = 200
+                                                Protocol = "iBGP"
+                                                ExitInterface = $null  # Will be determined by next hop lookup
+                                            }
+                                        }
+                                    }
+                                }
+
+                                # Also learn peer's connected routes if redistribute connected
+                                if ($peerDevice.BGPRedistributeConnected) {
+                                    foreach ($iface in $peerDevice.Interfaces.Values) {
+                                        if ($iface.VRF -eq $VRF -and $iface.IPAddress -and $iface.Network) {
+                                            $routingTable += @{
+                                                Destination = $iface.Network
+                                                Mask = $iface.SubnetMask
+                                                NextHop = $neighbor.IPAddress
+                                                Metric = 0
+                                                AdminDistance = 200
+                                                Protocol = "iBGP-Connected"
+                                                ExitInterface = $null
+                                            }
+                                        }
+                                    }
+                                }
+
+                                # Learn peer's static routes if redistribute static
+                                if ($peerDevice.BGPRedistributeStatic) {
+                                    foreach ($route in $peerDevice.Routes) {
+                                        if ($route.VRF -eq $VRF) {
+                                            $routingTable += @{
+                                                Destination = $route.Destination
+                                                Mask = $route.Mask
+                                                NextHop = $neighbor.IPAddress
+                                                Metric = 0
+                                                AdminDistance = 200
+                                                Protocol = "iBGP-Static"
+                                                ExitInterface = $null
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1817,7 +1989,7 @@ function Find-RoutingPath {
             }
         }
 
-        $routingTable = Build-RoutingTable -Device $currentDevice -VRF $deviceVRF
+        $routingTable = Build-RoutingTable -Device $currentDevice -VRF $deviceVRF -AllDevices $AllDevices
         $bestRoute = Find-BestRoute -RoutingTable $routingTable -DestIP $DestIP
 
         if (-not $bestRoute) {
@@ -1943,7 +2115,7 @@ function Get-ComprehensivePathAnalysis {
                 $hopAnalysis.VRF = $exitIface.VRF
 
                 # Build routing table
-                $routingTable = Build-RoutingTable -Device $device -VRF $exitIface.VRF
+                $routingTable = Build-RoutingTable -Device $device -VRF $exitIface.VRF -AllDevices $AllDevices
                 $bestRoute = Find-BestRoute -RoutingTable $routingTable -DestIP $DestIP
 
                 if ($bestRoute) {
