@@ -36,6 +36,12 @@ class NetworkInterface {
     [int]$CIDR
     [string]$Network
     [string]$VRF = "global"
+    [string]$ACL_In
+    [string]$ACL_Out
+    [string]$ServicePolicy_In
+    [string]$ServicePolicy_Out
+    [bool]$NATInside
+    [bool]$NATOutside
 
     NetworkInterface([string]$name) {
         $this.Name = $name
@@ -46,10 +52,12 @@ class Route {
     [string]$Destination
     [string]$Mask
     [string]$NextHop
-    [int]$Metric
+    [int]$Metric = 0
     [string]$Protocol
     [string]$ExitInterface
-    
+    [string]$VRF = "global"
+    [int]$AdminDistance = 1  # Default for static routes
+
     Route([string]$dest, [string]$mask, [string]$nextHop) {
         $this.Destination = $dest
         $this.Mask = $mask
@@ -68,7 +76,15 @@ class NetworkDevice {
     [string]$ConfigContent
     [double]$X = 0
     [double]$Y = 0
-    
+    [hashtable]$ACLs = @{}  # Name -> ACL object
+    [System.Collections.ArrayList]$NATRules = @()
+    [hashtable]$QoSClassMaps = @{}  # Name -> QoSClassMap
+    [hashtable]$QoSPolicyMaps = @{}  # Name -> QoSPolicyMap
+    [System.Collections.ArrayList]$BGPNeighbors = @()
+    [hashtable]$OSPFProcesses = @{}  # ProcessID -> OSPFProcess
+    [int]$BGP_ASN = 0
+    [string]$BGP_RouterID
+
     NetworkDevice([string]$hostname) {
         $this.Hostname = $hostname
     }
@@ -80,10 +96,101 @@ class Connection {
     [string]$Interface1
     [string]$Interface2
     [string]$ConnectionType = "L3" # L3, CDP, WAN
-    
+
     Connection([NetworkDevice]$dev1, [NetworkDevice]$dev2) {
         $this.Device1 = $dev1
         $this.Device2 = $dev2
+    }
+}
+
+class ACLEntry {
+    [int]$Sequence
+    [string]$Action  # permit, deny
+    [string]$Protocol  # ip, tcp, udp, icmp, etc.
+    [string]$SourceIP
+    [string]$SourceWildcard
+    [string]$DestIP
+    [string]$DestWildcard
+    [string]$SourcePort
+    [string]$DestPort
+    [string]$RawLine
+
+    ACLEntry([int]$seq, [string]$action, [string]$line) {
+        $this.Sequence = $seq
+        $this.Action = $action
+        $this.RawLine = $line
+    }
+}
+
+class ACL {
+    [string]$Name
+    [string]$Type  # standard, extended
+    [System.Collections.ArrayList]$Entries = @()
+
+    ACL([string]$name, [string]$type) {
+        $this.Name = $name
+        $this.Type = $type
+    }
+}
+
+class NATRule {
+    [string]$Type  # static, dynamic, pat
+    [string]$InsideLocal
+    [string]$InsideGlobal
+    [string]$OutsideLocal
+    [string]$OutsideGlobal
+    [string]$Interface
+    [string]$ACL
+    [string]$Pool
+    [bool]$Overload
+
+    NATRule([string]$type) {
+        $this.Type = $type
+    }
+}
+
+class QoSClassMap {
+    [string]$Name
+    [string]$MatchType  # match-any, match-all
+    [System.Collections.ArrayList]$MatchCriteria = @()
+
+    QoSClassMap([string]$name) {
+        $this.Name = $name
+    }
+}
+
+class QoSPolicyMap {
+    [string]$Name
+    [hashtable]$Classes = @{}  # ClassName -> Actions
+
+    QoSPolicyMap([string]$name) {
+        $this.Name = $name
+    }
+}
+
+class BGPNeighbor {
+    [string]$IPAddress
+    [int]$RemoteAS
+    [string]$Description
+    [string]$VRF = "global"
+    [bool]$RouteReflectorClient
+    [string]$UpdateSource
+
+    BGPNeighbor([string]$ip, [int]$asn) {
+        $this.IPAddress = $ip
+        $this.RemoteAS = $asn
+    }
+}
+
+class OSPFProcess {
+    [int]$ProcessID
+    [string]$RouterID
+    [string]$VRF = "global"
+    [hashtable]$Networks = @{}  # Network -> Area
+    [System.Collections.ArrayList]$PassiveInterfaces = @()
+
+    OSPFProcess([int]$pid) {
+        $this.ProcessID = $pid
     }
 }
 
@@ -111,9 +218,45 @@ function Parse-CiscoConfig {
     $rxOspf = [regex]'^router ospf'
     $rxTunnelInterface = [regex]'^(Tunnel|Loopback|Virtual-Template)'
 
+    # ACL patterns
+    $rxACLStandard = [regex]'^ip access-list standard\s+(.+)$'
+    $rxACLExtended = [regex]'^ip access-list extended\s+(.+)$'
+    $rxACLEntry = [regex]'^\s*(permit|deny)\s+(.+)$'
+    $rxACLGroup = [regex]'^\s*ip access-group\s+(\S+)\s+(in|out)'
+
+    # NAT patterns
+    $rxNATInside = [regex]'^\s*ip nat inside\s*$'
+    $rxNATOutside = [regex]'^\s*ip nat outside\s*$'
+    $rxNATStatic = [regex]'^ip nat inside source static\s+(\S+)\s+(\S+)'
+    $rxNATPAT = [regex]'^ip nat inside source list\s+(\S+)\s+interface\s+(\S+)\s+overload'
+
+    # QoS patterns
+    $rxClassMap = [regex]'^class-map\s+(?:match-(\w+)\s+)?(.+)$'
+    $rxPolicyMap = [regex]'^policy-map\s+(.+)$'
+    $rxServicePolicy = [regex]'^\s*service-policy\s+(input|output)\s+(.+)$'
+
+    # BGP patterns
+    $rxBGP = [regex]'^router bgp\s+(\d+)'
+    $rxBGPRouterID = [regex]'^\s*bgp router-id\s+(\d+\.\d+\.\d+\.\d+)'
+    $rxBGPNeighbor = [regex]'^\s*neighbor\s+(\d+\.\d+\.\d+\.\d+)\s+remote-as\s+(\d+)'
+
+    # OSPF patterns
+    $rxOSPFProcess = [regex]'^router ospf\s+(\d+)(?:\s+vrf\s+(\S+))?'
+    $rxOSPFRouterID = [regex]'^\s*router-id\s+(\d+\.\d+\.\d+\.\d+)'
+    $rxOSPFNetwork = [regex]'^\s*network\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+area\s+(\S+)'
+    $rxOSPFPassive = [regex]'^\s*passive-interface\s+(.+)$'
+
     $lines = $Content -split "`n"
     $currentInterface = $null
     $currentVRF = "global"
+    $currentACL = $null
+    $currentACLSeq = 10
+    $currentQoSClassMap = $null
+    $currentQoSPolicyMap = $null
+    $currentQoSClass = $null
+    $currentBGP = $false
+    $currentBGPVRF = "global"
+    $currentOSPF = $null
 
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $line = $lines[$i].Trim()
@@ -210,6 +353,48 @@ function Parse-CiscoConfig {
             }
         }
 
+        # Parse interface ACL bindings
+        if ($currentInterface) {
+            $m = $rxACLGroup.Match($line)
+            if ($m.Success) {
+                $aclName = $m.Groups[1].Value
+                $direction = $m.Groups[2].Value
+                if ($direction -eq "in") {
+                    $currentInterface.ACL_In = $aclName
+                } else {
+                    $currentInterface.ACL_Out = $aclName
+                }
+                continue
+            }
+        }
+
+        # Parse interface NAT inside/outside
+        if ($currentInterface) {
+            if ($rxNATInside.IsMatch($line)) {
+                $currentInterface.NATInside = $true
+                continue
+            }
+            if ($rxNATOutside.IsMatch($line)) {
+                $currentInterface.NATOutside = $true
+                continue
+            }
+        }
+
+        # Parse interface QoS service policy
+        if ($currentInterface) {
+            $m = $rxServicePolicy.Match($line)
+            if ($m.Success) {
+                $direction = $m.Groups[1].Value
+                $policyName = $m.Groups[2].Value.Trim()
+                if ($direction -eq "input") {
+                    $currentInterface.ServicePolicy_In = $policyName
+                } else {
+                    $currentInterface.ServicePolicy_Out = $policyName
+                }
+                continue
+            }
+        }
+
         # Parse static routes (with optional VRF)
         $m = $rxStaticRoute.Match($line)
         if ($m.Success) {
@@ -235,10 +420,163 @@ function Parse-CiscoConfig {
             continue
         }
 
-        # Parse OSPF
-        if ($rxOspf.IsMatch($line)) {
-            $device.DeviceType = "Router"
+        # Parse ACL definitions (standard/extended)
+        $m = $rxACLStandard.Match($line)
+        if ($m.Success) {
+            $aclName = $m.Groups[1].Value.Trim()
+            $currentACL = [ACL]::new($aclName, "standard")
+            $device.ACLs[$aclName] = $currentACL
+            $currentACLSeq = 10
+            $currentInterface = $null  # Exit interface context
             continue
+        }
+
+        $m = $rxACLExtended.Match($line)
+        if ($m.Success) {
+            $aclName = $m.Groups[1].Value.Trim()
+            $currentACL = [ACL]::new($aclName, "extended")
+            $device.ACLs[$aclName] = $currentACL
+            $currentACLSeq = 10
+            $currentInterface = $null
+            continue
+        }
+
+        # Parse ACL entries
+        if ($currentACL) {
+            $m = $rxACLEntry.Match($line)
+            if ($m.Success) {
+                $action = $m.Groups[1].Value
+                $entry = [ACLEntry]::new($currentACLSeq, $action, $line)
+
+                # Parse extended ACL details
+                $rest = $m.Groups[2].Value
+                if ($rest -match '^(\S+)\s+(.+)') {
+                    $entry.Protocol = $matches[1]
+                    # Further parsing of source/dest could be added here
+                }
+
+                [void]$currentACL.Entries.Add($entry)
+                $currentACLSeq += 10
+                continue
+            }
+        }
+
+        # Parse NAT rules
+        $m = $rxNATStatic.Match($line)
+        if ($m.Success) {
+            $nat = [NATRule]::new("static")
+            $nat.InsideLocal = $m.Groups[1].Value
+            $nat.InsideGlobal = $m.Groups[2].Value
+            [void]$device.NATRules.Add($nat)
+            continue
+        }
+
+        $m = $rxNATPAT.Match($line)
+        if ($m.Success) {
+            $nat = [NATRule]::new("pat")
+            $nat.ACL = $m.Groups[1].Value
+            $nat.Interface = $m.Groups[2].Value
+            $nat.Overload = $true
+            [void]$device.NATRules.Add($nat)
+            continue
+        }
+
+        # Parse QoS class-map
+        $m = $rxClassMap.Match($line)
+        if ($m.Success) {
+            $matchType = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { "match-all" }
+            $className = $m.Groups[2].Value.Trim()
+            $currentQoSClassMap = [QoSClassMap]::new($className)
+            $currentQoSClassMap.MatchType = $matchType
+            $device.QoSClassMaps[$className] = $currentQoSClassMap
+            $currentInterface = $null
+            continue
+        }
+
+        # Parse QoS policy-map
+        $m = $rxPolicyMap.Match($line)
+        if ($m.Success) {
+            $policyName = $m.Groups[1].Value.Trim()
+            $currentQoSPolicyMap = [QoSPolicyMap]::new($policyName)
+            $device.QoSPolicyMaps[$policyName] = $currentQoSPolicyMap
+            $currentInterface = $null
+            continue
+        }
+
+        # Parse BGP
+        $m = $rxBGP.Match($line)
+        if ($m.Success) {
+            $device.BGP_ASN = [int]$m.Groups[1].Value
+            $currentBGP = $true
+            $device.DeviceType = "Router"
+            $currentInterface = $null
+            continue
+        }
+
+        # Parse BGP router-id
+        if ($currentBGP) {
+            $m = $rxBGPRouterID.Match($line)
+            if ($m.Success) {
+                $device.BGP_RouterID = $m.Groups[1].Value
+                continue
+            }
+        }
+
+        # Parse BGP neighbors
+        if ($currentBGP) {
+            $m = $rxBGPNeighbor.Match($line)
+            if ($m.Success) {
+                $neighborIP = $m.Groups[1].Value
+                $remoteAS = [int]$m.Groups[2].Value
+                $neighbor = [BGPNeighbor]::new($neighborIP, $remoteAS)
+                $neighbor.VRF = $currentBGPVRF
+                [void]$device.BGPNeighbors.Add($neighbor)
+                continue
+            }
+        }
+
+        # Parse OSPF process
+        $m = $rxOSPFProcess.Match($line)
+        if ($m.Success) {
+            $processID = [int]$m.Groups[1].Value
+            $vrfName = if ($m.Groups[2].Success) { $m.Groups[2].Value } else { "global" }
+            $currentOSPF = [OSPFProcess]::new($processID)
+            $currentOSPF.VRF = $vrfName
+            $device.OSPFProcesses[$processID] = $currentOSPF
+            $device.DeviceType = "Router"
+            $currentInterface = $null
+            continue
+        }
+
+        # Parse OSPF router-id
+        if ($currentOSPF) {
+            $m = $rxOSPFRouterID.Match($line)
+            if ($m.Success) {
+                $currentOSPF.RouterID = $m.Groups[1].Value
+                continue
+            }
+        }
+
+        # Parse OSPF network statements
+        if ($currentOSPF) {
+            $m = $rxOSPFNetwork.Match($line)
+            if ($m.Success) {
+                $network = $m.Groups[1].Value
+                $wildcard = $m.Groups[2].Value
+                $area = $m.Groups[3].Value
+                $currentOSPF.Networks["$network/$wildcard"] = $area
+                continue
+            }
+        }
+
+        # Parse OSPF passive interfaces
+        if ($currentOSPF) {
+            $m = $rxOSPFPassive.Match($line)
+            if ($m.Success) {
+                $ifaceName = $m.Groups[1].Value.Trim()
+                [void]$currentOSPF.PassiveInterfaces.Add($ifaceName)
+                continue
+            }
         }
     }
 
@@ -328,6 +666,181 @@ function Test-SameSubnet {
     $net2 = Get-NetworkAddress -IP $IP2 -Mask $Mask2
 
     return $net1 -eq $net2
+}
+
+#endregion
+
+#region Analysis Functions
+
+function Test-ACLMatch {
+    param(
+        [ACL]$ACL,
+        [string]$SourceIP,
+        [string]$DestIP,
+        [string]$Protocol = "ip"
+    )
+
+    if (-not $ACL) { return @{Action="permit"; Reason="No ACL"} }
+
+    # Simple ACL evaluation (can be extended for full match logic)
+    foreach ($entry in $ACL.Entries) {
+        # For now, return first matching entry
+        # Full implementation would parse source/dest and match against traffic
+        if ($entry.Protocol -eq $Protocol -or $entry.Protocol -eq "ip") {
+            return @{
+                Action = $entry.Action
+                Reason = "ACL $($ACL.Name) line $($entry.Sequence)"
+                Entry = $entry
+            }
+        }
+    }
+
+    # Implicit deny at end
+    return @{Action="deny"; Reason="Implicit deny (end of ACL)"}
+}
+
+function Apply-NATTranslation {
+    param(
+        [NetworkDevice]$Device,
+        [string]$SourceIP,
+        [string]$Interface
+    )
+
+    # Check for static NAT
+    foreach ($nat in $Device.NATRules) {
+        if ($nat.Type -eq "static" -and $nat.InsideLocal -eq $SourceIP) {
+            return @{
+                Translated = $true
+                NewIP = $nat.InsideGlobal
+                Type = "Static NAT"
+            }
+        }
+    }
+
+    # Check for PAT (overload)
+    foreach ($nat in $Device.NATRules) {
+        if ($nat.Type -eq "pat" -and $nat.Interface -eq $Interface) {
+            # Get interface IP for PAT
+            $iface = $Device.Interfaces[$Interface]
+            if ($iface -and $iface.IPAddress) {
+                return @{
+                    Translated = $true
+                    NewIP = $iface.IPAddress
+                    Type = "PAT (Overload)"
+                }
+            }
+        }
+    }
+
+    return @{Translated=$false}
+}
+
+function Get-QoSMarking {
+    param(
+        [NetworkDevice]$Device,
+        [string]$PolicyMapName,
+        [string]$Protocol = "ip"
+    )
+
+    if (-not $PolicyMapName -or -not $Device.QoSPolicyMaps.ContainsKey($PolicyMapName)) {
+        return @{Applied=$false}
+    }
+
+    $policyMap = $Device.QoSPolicyMaps[$PolicyMapName]
+
+    # Simple QoS analysis - return policy exists
+    return @{
+        Applied = $true
+        PolicyMap = $policyMap.Name
+        Classes = $policyMap.Classes.Keys -join ", "
+    }
+}
+
+function Build-RoutingTable {
+    param(
+        [NetworkDevice]$Device,
+        [string]$VRF = "global"
+    )
+
+    $routingTable = @()
+
+    # Add static routes (Admin Distance = 1)
+    foreach ($route in $Device.Routes) {
+        if ($route.VRF -eq $VRF -or $route.ExitInterface -eq $VRF) {
+            $routingTable += @{
+                Destination = $route.Destination
+                Mask = $route.Mask
+                NextHop = $route.NextHop
+                Metric = $route.Metric
+                AdminDistance = 1
+                Protocol = "Static"
+                ExitInterface = $route.ExitInterface
+            }
+        }
+    }
+
+    # Add OSPF routes (Admin Distance = 110)
+    foreach ($ospfProc in $Device.OSPFProcesses.Values) {
+        if ($ospfProc.VRF -eq $VRF) {
+            foreach ($network in $ospfProc.Networks.Keys) {
+                # OSPF-advertised networks would be learned routes
+                # For now, we just note OSPF is running
+                # In real implementation, would need OSPF database
+            }
+        }
+    }
+
+    # Add BGP routes (Admin Distance = 20 for eBGP, 200 for iBGP)
+    # This would require BGP RIB which we don't have from static configs
+
+    # Add connected routes (Admin Distance = 0)
+    foreach ($iface in $Device.Interfaces.Values) {
+        if ($iface.VRF -eq $VRF -and $iface.IPAddress -and $iface.Status -eq "up") {
+            $routingTable += @{
+                Destination = $iface.Network
+                Mask = $iface.SubnetMask
+                NextHop = "Connected"
+                Metric = 0
+                AdminDistance = 0
+                Protocol = "Connected"
+                ExitInterface = $iface.Name
+            }
+        }
+    }
+
+    return $routingTable
+}
+
+function Find-BestRoute {
+    param(
+        [array]$RoutingTable,
+        [string]$DestIP
+    )
+
+    $matchingRoutes = @()
+
+    foreach ($route in $RoutingTable) {
+        $destNetwork = Get-NetworkAddress -IP $route.Destination -Mask $route.Mask
+        $testNetwork = Get-NetworkAddress -IP $DestIP -Mask $route.Mask
+
+        if ($destNetwork -eq $testNetwork) {
+            $cidr = ConvertTo-CIDR -SubnetMask $route.Mask
+            $matchingRoutes += $route | Add-Member -MemberType NoteProperty -Name CIDR -Value $cidr -PassThru
+        }
+    }
+
+    if ($matchingRoutes.Count -eq 0) {
+        return $null
+    }
+
+    # Sort by longest prefix match (highest CIDR), then admin distance, then metric
+    $bestRoute = $matchingRoutes |
+        Sort-Object -Property @{Expression={$_.CIDR}; Descending=$true},
+                              @{Expression={$_.AdminDistance}; Descending=$false},
+                              @{Expression={$_.Metric}; Descending=$false} |
+        Select-Object -First 1
+
+    return $bestRoute
 }
 
 #endregion
@@ -549,6 +1062,98 @@ function Find-Path {
     }
     
     return @() # No path found
+}
+
+function Get-ComprehensivePathAnalysis {
+    param(
+        [array]$Path,  # Array of device hostnames
+        [System.Collections.ArrayList]$AllDevices,
+        [array]$Connections,
+        [string]$SourceIP = "10.10.10.100",  # Simulated source
+        [string]$DestIP = "10.20.20.100"     # Simulated destination
+    )
+
+    $analysis = @()
+
+    for ($i = 0; $i -lt $Path.Count; $i++) {
+        $deviceName = $Path[$i]
+        $device = $AllDevices | Where-Object { $_.Hostname -eq $deviceName }
+
+        $hopAnalysis = @{
+            HopNumber = $i + 1
+            DeviceName = $deviceName
+            DeviceType = $device.DeviceType
+            Analysis = @()
+        }
+
+        if ($i -lt $Path.Count - 1) {
+            # Find connection to next hop
+            $nextDevice = $Path[$i + 1]
+            $conn = $Connections | Where-Object {
+                ($_.Device1.Hostname -eq $deviceName -and $_.Device2.Hostname -eq $nextDevice) -or
+                ($_.Device2.Hostname -eq $deviceName -and $_.Device1.Hostname -eq $nextDevice)
+            } | Select-Object -First 1
+
+            if ($conn) {
+                $exitIfaceName = if ($conn.Device1.Hostname -eq $deviceName) { $conn.Interface1 } else { $conn.Interface2 }
+                $exitIface = $device.Interfaces[$exitIfaceName]
+
+                $hopAnalysis.ExitInterface = $exitIfaceName
+                $hopAnalysis.ExitIP = $exitIface.IPAddress
+                $hopAnalysis.VRF = $exitIface.VRF
+
+                # Build routing table
+                $routingTable = Build-RoutingTable -Device $device -VRF $exitIface.VRF
+                $bestRoute = Find-BestRoute -RoutingTable $routingTable -DestIP $DestIP
+
+                if ($bestRoute) {
+                    $hopAnalysis.Analysis += "→ Routing: $($bestRoute.Protocol) route via $($bestRoute.NextHop) [AD: $($bestRoute.AdminDistance), Metric: $($bestRoute.Metric)]"
+                }
+
+                # Check outbound ACL
+                if ($exitIface.ACL_Out) {
+                    $acl = $device.ACLs[$exitIface.ACL_Out]
+                    $aclResult = Test-ACLMatch -ACL $acl -SourceIP $SourceIP -DestIP $DestIP
+                    if ($aclResult.Action -eq "deny") {
+                        $hopAnalysis.Analysis += "✗ Outbound ACL ($($exitIface.ACL_Out)): DENIED - $($aclResult.Reason)"
+                        $hopAnalysis.Blocked = $true
+                    } else {
+                        $hopAnalysis.Analysis += "✓ Outbound ACL ($($exitIface.ACL_Out)): PERMITTED"
+                    }
+                }
+
+                # Check NAT
+                if ($exitIface.NATInside -or $exitIface.NATOutside) {
+                    $natResult = Apply-NATTranslation -Device $device -SourceIP $SourceIP -Interface $exitIfaceName
+                    if ($natResult.Translated) {
+                        $hopAnalysis.Analysis += "⟲ NAT: $SourceIP → $($natResult.NewIP) ($($natResult.Type))"
+                        $SourceIP = $natResult.NewIP  # Update source IP for next hop
+                    }
+                }
+
+                # Check QoS
+                if ($exitIface.ServicePolicy_Out) {
+                    $qosResult = Get-QoSMarking -Device $device -PolicyMapName $exitIface.ServicePolicy_Out
+                    if ($qosResult.Applied) {
+                        $hopAnalysis.Analysis += "⚡ QoS: Policy $($qosResult.PolicyMap) applied"
+                    }
+                }
+
+                # Check BGP/OSPF if configured
+                if ($device.BGP_ASN -gt 0) {
+                    $hopAnalysis.Analysis += "ℹ BGP AS$($device.BGP_ASN) configured ($($device.BGPNeighbors.Count) neighbors)"
+                }
+                if ($device.OSPFProcesses.Count -gt 0) {
+                    $processes = $device.OSPFProcesses.Keys -join ", "
+                    $hopAnalysis.Analysis += "ℹ OSPF process(es): $processes"
+                }
+            }
+        }
+
+        $analysis += $hopAnalysis
+    }
+
+    return $analysis
 }
 
 #endregion
@@ -792,37 +1397,58 @@ function Show-NetworkMap {
             }
         }
 
-        # Display path details
-        $details = "Path from $($srcDevice.Hostname) to $($dstDevice.Hostname):`n"
-        $details += "=" * 60 + "`n`n"
+        # Get comprehensive path analysis
+        $comprehensiveAnalysis = Get-ComprehensivePathAnalysis -Path $path -AllDevices $Devices -Connections $Connections
 
-        for ($i = 0; $i -lt $path.Count; $i++) {
-            $deviceName = $path[$i]
-            $device = $Devices | Where-Object { $_.Hostname -eq $deviceName }
+        # Display comprehensive path details
+        $details = "COMPREHENSIVE PATH ANALYSIS`n"
+        $details += "Path from $($srcDevice.Hostname) to $($dstDevice.Hostname):`n"
+        $details += "=" * 80 + "`n`n"
 
-            $details += "Hop $($i + 1): $deviceName ($($device.DeviceType))`n"
+        $pathBlocked = $false
 
-            if ($i -lt $path.Count - 1) {
-                $nextDevice = $path[$i + 1]
-                $conn = $Connections | Where-Object {
-                    ($_.Device1.Hostname -eq $deviceName -and $_.Device2.Hostname -eq $nextDevice) -or
-                    ($_.Device2.Hostname -eq $deviceName -and $_.Device1.Hostname -eq $nextDevice)
-                } | Select-Object -First 1
+        foreach ($hop in $comprehensiveAnalysis) {
+            $details += "Hop $($hop.HopNumber): $($hop.DeviceName) ($($hop.DeviceType))`n"
 
-                if ($conn) {
-                    $ifaceName = if ($conn.Device1.Hostname -eq $deviceName) { $conn.Interface1 } else { $conn.Interface2 }
-                    $iface = $device.Interfaces[$ifaceName]
-                    if ($iface) {
-                        $details += "  Exit Interface: $ifaceName ($($iface.IPAddress)"
-                        if ($iface.VRF -ne "global") {
-                            $details += " [VRF: $($iface.VRF)]"
-                        }
-                        $details += ")`n"
-                    }
+            if ($hop.ExitInterface) {
+                $details += "  Exit Interface: $($hop.ExitInterface) ($($hop.ExitIP))"
+                if ($hop.VRF -ne "global") {
+                    $details += " [VRF: $($hop.VRF)]"
                 }
                 $details += "`n"
             }
+
+            # Display all analysis results
+            foreach ($analysisLine in $hop.Analysis) {
+                $details += "  $analysisLine`n"
+            }
+
+            if ($hop.Blocked) {
+                $details += "`n  *** PATH BLOCKED AT THIS HOP ***`n"
+                $pathBlocked = $true
+                break
+            }
+
+            $details += "`n"
         }
+
+        if ($pathBlocked) {
+            $details += "`n" + "=" * 80 + "`n"
+            $details += "RESULT: Traffic DENIED - path blocked by ACL/firewall`n"
+        } else {
+            $details += "=" * 80 + "`n"
+            $details += "RESULT: Path is VALID - traffic would be forwarded successfully`n"
+        }
+
+        # Add summary statistics
+        $details += "`nPATH STATISTICS:`n"
+        $details += "  Total Hops: $($path.Count)`n"
+        $aclCount = ($comprehensiveAnalysis | Where-Object { $_.Analysis -match "ACL" }).Count
+        $natCount = ($comprehensiveAnalysis | Where-Object { $_.Analysis -match "NAT" }).Count
+        $qosCount = ($comprehensiveAnalysis | Where-Object { $_.Analysis -match "QoS" }).Count
+        if ($aclCount -gt 0) { $details += "  ACL Checks: $aclCount`n" }
+        if ($natCount -gt 0) { $details += "  NAT Translations: $natCount`n" }
+        if ($qosCount -gt 0) { $details += "  QoS Policies: $qosCount`n" }
 
         $detailsBox.Text = $details
     })
