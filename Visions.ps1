@@ -1291,7 +1291,7 @@ function Find-RoutingPath {
                     # Check if next hop is in this interface's subnet
                     if (Test-SameSubnet -IP1 $iface.IPAddress -Mask1 $iface.SubnetMask -IP2 $nextHopIP -Mask2 $iface.SubnetMask) {
                         $exitInterface = $iface
-                        $pathHop.Reason = "Route to $($bestRoute.Destination)/$($ConvertTo-CIDR -SubnetMask $bestRoute.Mask) via $nextHopIP [Protocol: $($bestRoute.Protocol), AD: $($bestRoute.AdminDistance), Metric: $($bestRoute.Metric)]"
+                        $pathHop.Reason = "Route to $($bestRoute.Destination)/$(ConvertTo-CIDR -SubnetMask $bestRoute.Mask) via $nextHopIP [Protocol: $($bestRoute.Protocol), AD: $($bestRoute.AdminDistance), Metric: $($bestRoute.Metric)]"
                         break
                     }
                 }
