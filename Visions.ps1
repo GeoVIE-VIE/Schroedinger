@@ -1957,10 +1957,8 @@ function Show-NetworkMap {
                     }
                 }
 
-                # Auto-select first interface if available
-                if ($sourceInterfaceCombo.Items.Count -gt 0) {
-                    $sourceInterfaceCombo.SelectedIndex = 0
-                }
+                # Don't auto-select - let user choose which interface/IP they want to use as source
+                # This gives more control over the source IP for the trace
             }
         }
     })
@@ -2000,10 +1998,8 @@ function Show-NetworkMap {
                     }
                 }
 
-                # Auto-select first interface if available
-                if ($destInterfaceCombo.Items.Count -gt 0) {
-                    $destInterfaceCombo.SelectedIndex = 0
-                }
+                # Don't auto-select - let user choose which interface/IP they want to trace to
+                # This allows tracing to any interface on the device, not just the first one
             }
         }
     })
@@ -2782,6 +2778,15 @@ function Show-NetworkMap {
     $clearButton.Add_Click({
         Reset-AllDevices  # Reset ALL devices to default colors
         $detailsBox.Text = ""
+
+        # Clear all selections
+        $sourceCombo.SelectedIndex = -1
+        $destCombo.SelectedIndex = -1
+        $sourceInterfaceCombo.Items.Clear()
+        $destInterfaceCombo.Items.Clear()
+        $sourceIPBox.Text = "10.10.10.100"  # Reset to default
+        $destIPBox.Text = "10.20.20.100"    # Reset to default
+        $useRoutingCheckBox.IsChecked = $true  # Reset to default
     })
     
     # Show window
