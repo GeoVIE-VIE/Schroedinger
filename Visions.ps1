@@ -919,14 +919,45 @@ function Calculate-Layout {
     $marginY = 200
     $verticalSpacing = 350  # Space between layers
 
-    # Build adjacency list for faster lookups
+    # Build adjacency list and identify WAN links
     $adjacency = @{}
+    $wanLinks = @{}  # Track WAN connections
+    $lanLinks = @{}  # Track LAN connections
+
     foreach ($device in $Devices) {
         $adjacency[$device.Hostname] = @()
+        $wanLinks[$device.Hostname] = @()
+        $lanLinks[$device.Hostname] = @()
     }
+
     foreach ($conn in $Connections) {
         $adjacency[$conn.Device1.Hostname] += $conn.Device2
         $adjacency[$conn.Device2.Hostname] += $conn.Device1
+
+        # Identify WAN vs LAN based on interface types
+        $isWAN = $false
+
+        # WAN interface patterns: Serial, Tunnel, Dialer, Cellular
+        if ($conn.Interface1 -match '^(Serial|Tunnel|Dialer|Cellular|ATM|Frame-Relay)' -or
+            $conn.Interface2 -match '^(Serial|Tunnel|Dialer|Cellular|ATM|Frame-Relay)') {
+            $isWAN = $true
+        }
+
+        # Also check if devices are explicitly named as branch/remote/wan
+        if (($conn.Device1.Hostname -match '(?i)(branch|remote|site)' -and
+             $conn.Device2.Hostname -match '(?i)(wan|hub|hq|datacenter|core)') -or
+            ($conn.Device2.Hostname -match '(?i)(branch|remote|site)' -and
+             $conn.Device1.Hostname -match '(?i)(wan|hub|hq|datacenter|core)')) {
+            $isWAN = $true
+        }
+
+        if ($isWAN) {
+            $wanLinks[$conn.Device1.Hostname] += $conn.Device2
+            $wanLinks[$conn.Device2.Hostname] += $conn.Device1
+        } else {
+            $lanLinks[$conn.Device1.Hostname] += $conn.Device2
+            $lanLinks[$conn.Device2.Hostname] += $conn.Device1
+        }
     }
 
     # Find root devices (core/WAN routers with routing protocols or high connectivity)
@@ -971,7 +1002,7 @@ function Calculate-Layout {
         }
     }
 
-    # Assign layers using BFS from roots
+    # Assign layers using BFS from roots (prioritize LAN connectivity)
     $deviceLayers = @{}
     $visited = @{}
     $queue = New-Object System.Collections.Queue
@@ -983,16 +1014,50 @@ function Calculate-Layout {
         $queue.Enqueue($root.Hostname)
     }
 
-    # BFS to assign layers based on distance from roots
+    # BFS to assign layers - use LAN links primarily for hierarchy
     while ($queue.Count -gt 0) {
         $currentName = $queue.Dequeue()
         $currentLayer = $deviceLayers[$currentName]
 
-        foreach ($neighbor in $adjacency[$currentName]) {
+        # Process LAN neighbors first (creates proper hierarchy)
+        foreach ($neighbor in $lanLinks[$currentName]) {
             if (-not $visited[$neighbor.Hostname]) {
                 $visited[$neighbor.Hostname] = $true
                 $deviceLayers[$neighbor.Hostname] = $currentLayer + 1
                 $queue.Enqueue($neighbor.Hostname)
+            }
+        }
+
+        # Then process WAN neighbors (but don't create deep hierarchy for branches)
+        foreach ($neighbor in $wanLinks[$currentName]) {
+            if (-not $visited[$neighbor.Hostname]) {
+                $visited[$neighbor.Hostname] = $true
+                # WAN branches go one layer down from hub
+                $deviceLayers[$neighbor.Hostname] = $currentLayer + 1
+                $queue.Enqueue($neighbor.Hostname)
+            }
+        }
+    }
+
+    # Identify branch sites connected to same WAN hub and normalize their layers
+    $wanHubs = @()
+    foreach ($device in $Devices) {
+        if ($wanLinks[$device.Hostname].Count -ge 2 -and
+            $device.Hostname -match '(?i)(wan|hub|hq|datacenter|core|mpls)') {
+            $wanHubs += $device
+        }
+    }
+
+    # Group branches by their WAN hub and set them to same layer
+    foreach ($hub in $wanHubs) {
+        $hubLayer = $deviceLayers[$hub.Hostname]
+        $branchLayer = $hubLayer + 1
+
+        foreach ($branch in $wanLinks[$hub.Hostname]) {
+            # If this is a branch site, normalize to branch layer
+            if ($branch.Hostname -match '(?i)(branch|remote|site)' -or
+                ($wanLinks[$branch.Hostname].Count -le 2 -and $lanLinks[$branch.Hostname].Count -le 2)) {
+                $deviceLayers[$branch.Hostname] = $branchLayer
             }
         }
     }
@@ -1045,31 +1110,74 @@ function Calculate-Layout {
                 $parents = $layers[$layerNum - 1]
                 $positioned = @{}
 
-                # Position devices under their connected parent
+                # Group branches by their WAN hub parent
+                $hubGroups = @{}
                 foreach ($device in $devicesInLayer) {
                     $parent = $null
-                    foreach ($neighbor in $adjacency[$device.Hostname]) {
+                    $isWANBranch = $false
+
+                    # Find parent (check WAN links first for branches)
+                    foreach ($neighbor in $wanLinks[$device.Hostname]) {
                         if ($deviceLayers[$neighbor.Hostname] -eq ($layerNum - 1)) {
                             $parent = $neighbor
+                            $isWANBranch = $true
                             break
                         }
                     }
 
+                    # If no WAN parent, check LAN links
+                    if (-not $parent) {
+                        foreach ($neighbor in $lanLinks[$device.Hostname]) {
+                            if ($deviceLayers[$neighbor.Hostname] -eq ($layerNum - 1)) {
+                                $parent = $neighbor
+                                break
+                            }
+                        }
+                    }
+
                     if ($parent) {
-                        # Position near parent's X coordinate
-                        $device.X = $parent.X
-                        $device.Y = $y
-                        $positioned[$device.Hostname] = $true
+                        $parentName = $parent.Hostname
+                        if (-not $hubGroups.ContainsKey($parentName)) {
+                            $hubGroups[$parentName] = @()
+                        }
+                        $hubGroups[$parentName] += $device
                     }
                 }
 
-                # Position remaining devices
+                # Position each hub's children grouped together
+                $currentX = $marginX
+                foreach ($hubName in $hubGroups.Keys) {
+                    $parent = $Devices | Where-Object { $_.Hostname -eq $hubName }
+                    $children = $hubGroups[$hubName]
+
+                    if ($children.Count -eq 1) {
+                        # Single child - position under parent
+                        $children[0].X = $parent.X
+                        $children[0].Y = $y
+                        $positioned[$children[0].Hostname] = $true
+                    }
+                    else {
+                        # Multiple children - spread them around parent's X
+                        $groupWidth = ($children.Count - 1) * 200
+                        $groupStartX = $parent.X - ($groupWidth / 2)
+
+                        for ($i = 0; $i -lt $children.Count; $i++) {
+                            $children[$i].X = $groupStartX + ($i * 200)
+                            $children[$i].Y = $y
+                            $positioned[$children[$i].Hostname] = $true
+                        }
+                    }
+                }
+
+                # Position remaining devices (not connected to parent layer)
                 $unpositioned = $devicesInLayer | Where-Object { -not $positioned.ContainsKey($_.Hostname) }
-                $startX = $marginX
-                foreach ($device in $unpositioned) {
-                    $device.X = $startX
-                    $device.Y = $y
-                    $startX += $spacing
+                if ($unpositioned.Count -gt 0) {
+                    $startX = $marginX
+                    foreach ($device in $unpositioned) {
+                        $device.X = $startX
+                        $device.Y = $y
+                        $startX += $spacing
+                    }
                 }
             }
             else {
