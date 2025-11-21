@@ -170,7 +170,7 @@ $natResult = Apply-NATTranslation -Device $device -SourceIP "10.10.10.100" -Inte
 ```
 
 **Logic:**
-1. Check for static NAT match (inside local → inside global)
+1. Check for static NAT match (inside local -> inside global)
 2. Check for PAT/overload (uses interface IP)
 3. Returns translated IP for use in subsequent hops
 
@@ -254,12 +254,12 @@ This is the **core analysis engine** that provides hop-by-hop detailed analysis.
 ```
 Hop 1: C8500-BR1 (Router)
   Exit Interface: TenGigabitEthernet1/0/1 (203.0.113.2 [VRF: TRANSIT-INET])
-  → Routing: Connected route via Connected [AD: 0, Metric: 0]
-  ✓ Outbound ACL (INTERNET-OUT): PERMITTED
-  ⟲ NAT: 10.10.10.100 → 203.0.113.2 (PAT (Overload))
-  ⚡ QoS: Policy PM-WAN-OUT applied
-  ℹ BGP AS65001 configured (2 neighbors)
-  ℹ OSPF process(es): 10
+  [Routing] Connected route via Connected [AD: 0, Metric: 0]
+  [ACL-PERMIT] Outbound ACL (INTERNET-OUT): PERMITTED
+  [NAT] 10.10.10.100 -> 203.0.113.2 (PAT (Overload))
+  [QoS] Policy PM-WAN-OUT applied
+  [BGP] AS65001 configured (2 neighbors)
+  [OSPF] Process(es): 10
 ```
 
 ---
@@ -275,11 +275,11 @@ Path from Branch-A to Core-Router:
 
 Hop 1: Branch-A (Router)
   Exit Interface: GigabitEthernet0/0 (10.1.1.1 [VRF: global])
-  → Routing: Connected route via Connected [AD: 0, Metric: 0]
+  [Routing] Connected route via Connected [AD: 0, Metric: 0]
 
 Hop 2: Core-Router (Router)
   Exit Interface: GigabitEthernet0/1 (10.2.1.1 [VRF: global])
-  → Routing: Connected route via Connected [AD: 0, Metric: 0]
+  [Routing] Connected route via Connected [AD: 0, Metric: 0]
 
 Hop 3: Branch-B (Router)
 
@@ -295,8 +295,8 @@ PATH STATISTICS:
 ```
 Hop 2: C8500-BR1 (Router)
   Exit Interface: TenGigabitEthernet1/0/1 (203.0.113.2 [VRF: TRANSIT-INET])
-  → Routing: Static route via 203.0.113.1 [AD: 1, Metric: 0]
-  ✗ Outbound ACL (INET-FILTER): DENIED - ACL INET-FILTER line 20
+  [Routing] Static route via 203.0.113.1 [AD: 1, Metric: 0]
+  [ACL-DENY] Outbound ACL (INET-FILTER): DENIED - ACL INET-FILTER line 20
 
   *** PATH BLOCKED AT THIS HOP ***
 
@@ -426,7 +426,7 @@ function Calculate-OSPFShortestPath {
 ### Test Scenario 5: BGP/OSPF Display
 1. Load config with BGP and OSPF configured
 2. Trace path
-3. Verify "ℹ BGP AS..." and "ℹ OSPF..." lines appear
+3. Verify "[BGP] AS..." and "[OSPF] Process(es)..." lines appear
 
 ---
 

@@ -1107,7 +1107,7 @@ function Get-ComprehensivePathAnalysis {
                 $bestRoute = Find-BestRoute -RoutingTable $routingTable -DestIP $DestIP
 
                 if ($bestRoute) {
-                    $hopAnalysis.Analysis += "→ Routing: $($bestRoute.Protocol) route via $($bestRoute.NextHop) [AD: $($bestRoute.AdminDistance), Metric: $($bestRoute.Metric)]"
+                    $hopAnalysis.Analysis += "[Routing] $($bestRoute.Protocol) route via $($bestRoute.NextHop) [AD: $($bestRoute.AdminDistance), Metric: $($bestRoute.Metric)]"
                 }
 
                 # Check outbound ACL
@@ -1115,10 +1115,10 @@ function Get-ComprehensivePathAnalysis {
                     $acl = $device.ACLs[$exitIface.ACL_Out]
                     $aclResult = Test-ACLMatch -ACL $acl -SourceIP $SourceIP -DestIP $DestIP
                     if ($aclResult.Action -eq "deny") {
-                        $hopAnalysis.Analysis += "✗ Outbound ACL ($($exitIface.ACL_Out)): DENIED - $($aclResult.Reason)"
+                        $hopAnalysis.Analysis += "[ACL-DENY] Outbound ACL ($($exitIface.ACL_Out)): DENIED - $($aclResult.Reason)"
                         $hopAnalysis.Blocked = $true
                     } else {
-                        $hopAnalysis.Analysis += "✓ Outbound ACL ($($exitIface.ACL_Out)): PERMITTED"
+                        $hopAnalysis.Analysis += "[ACL-PERMIT] Outbound ACL ($($exitIface.ACL_Out)): PERMITTED"
                     }
                 }
 
@@ -1126,7 +1126,7 @@ function Get-ComprehensivePathAnalysis {
                 if ($exitIface.NATInside -or $exitIface.NATOutside) {
                     $natResult = Apply-NATTranslation -Device $device -SourceIP $SourceIP -Interface $exitIfaceName
                     if ($natResult.Translated) {
-                        $hopAnalysis.Analysis += "⟲ NAT: $SourceIP → $($natResult.NewIP) ($($natResult.Type))"
+                        $hopAnalysis.Analysis += "[NAT] $SourceIP -> $($natResult.NewIP) ($($natResult.Type))"
                         $SourceIP = $natResult.NewIP  # Update source IP for next hop
                     }
                 }
@@ -1135,17 +1135,17 @@ function Get-ComprehensivePathAnalysis {
                 if ($exitIface.ServicePolicy_Out) {
                     $qosResult = Get-QoSMarking -Device $device -PolicyMapName $exitIface.ServicePolicy_Out
                     if ($qosResult.Applied) {
-                        $hopAnalysis.Analysis += "⚡ QoS: Policy $($qosResult.PolicyMap) applied"
+                        $hopAnalysis.Analysis += "[QoS] Policy $($qosResult.PolicyMap) applied"
                     }
                 }
 
                 # Check BGP/OSPF if configured
                 if ($device.BGP_ASN -gt 0) {
-                    $hopAnalysis.Analysis += "ℹ BGP AS$($device.BGP_ASN) configured ($($device.BGPNeighbors.Count) neighbors)"
+                    $hopAnalysis.Analysis += "[BGP] AS$($device.BGP_ASN) configured ($($device.BGPNeighbors.Count) neighbors)"
                 }
                 if ($device.OSPFProcesses.Count -gt 0) {
                     $processes = $device.OSPFProcesses.Keys -join ", "
-                    $hopAnalysis.Analysis += "ℹ OSPF process(es): $processes"
+                    $hopAnalysis.Analysis += "[OSPF] Process(es): $processes"
                 }
             }
         }
