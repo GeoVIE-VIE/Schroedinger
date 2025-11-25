@@ -2550,7 +2550,7 @@ function Show-NetworkMap {
 <Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="Network Path Tracer" Height="700" Width="1000"
+    Title="Network Path Tracer" Height="700" Width="1200"
     WindowStartupLocation="CenterScreen">
     <Grid>
         <Grid.RowDefinitions>
