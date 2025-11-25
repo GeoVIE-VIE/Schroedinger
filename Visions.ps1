@@ -87,6 +87,7 @@ class NetworkDevice {
     [string]$BGP_RouterID
     [bool]$BGPRedistributeConnected = $false
     [bool]$BGPRedistributeStatic = $false
+    [System.Collections.ArrayList]$ManualRoutes = @()  # User-added routes via UI
 
     NetworkDevice([string]$hostname) {
         $this.Hostname = $hostname
@@ -877,6 +878,21 @@ function Build-RoutingTable {
     )
 
     $routingTable = @()
+
+    # Add manual routes (highest priority, Admin Distance = 0)
+    foreach ($route in $Device.ManualRoutes) {
+        if ($route.VRF -eq $VRF) {
+            $routingTable += @{
+                Destination = $route.Destination
+                Mask = $route.Mask
+                NextHop = $route.NextHop
+                Metric = $route.Metric
+                AdminDistance = 0
+                Protocol = "Manual"
+                ExitInterface = $route.ExitInterface
+            }
+        }
+    }
 
     # Add static routes (Admin Distance = 1)
     foreach ($route in $Device.Routes) {
@@ -2172,6 +2188,279 @@ function Get-ComprehensivePathAnalysis {
 
 #region GUI
 
+function Show-RoutingTableDialog {
+    param(
+        [System.Collections.ArrayList]$Devices,
+        [System.Windows.Window]$ParentWindow
+    )
+
+    # Create XAML for routing table dialog
+    [xml]$xaml = @"
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Routing Table Management" Height="600" Width="900"
+    WindowStartupLocation="CenterOwner">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Device Selection -->
+        <StackPanel Grid.Row="0" Background="#F0F0F0" Margin="5" Orientation="Horizontal">
+            <Label Content="Device:" VerticalAlignment="Center" Margin="5"/>
+            <ComboBox Name="DeviceCombo" Width="200" Margin="5" VerticalAlignment="Center"/>
+            <Label Content="(Select a device to view/edit its routing table)" VerticalAlignment="Center" Margin="20,0,0,0" Foreground="Gray" FontStyle="Italic"/>
+        </StackPanel>
+
+        <!-- Routing Table Display -->
+        <Border Grid.Row="1" BorderBrush="#CCCCCC" BorderThickness="1" Margin="5">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <Label Grid.Row="0" Content="Routes (parsed from config + manual entries):" FontWeight="Bold" Background="#F0F0F0"/>
+
+                <DataGrid Grid.Row="1" Name="RoutesDataGrid" AutoGenerateColumns="False"
+                          CanUserAddRows="False" CanUserDeleteRows="False"
+                          IsReadOnly="True" GridLinesVisibility="All">
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Header="Destination" Binding="{Binding Destination}" Width="120"/>
+                        <DataGridTextColumn Header="Mask" Binding="{Binding Mask}" Width="120"/>
+                        <DataGridTextColumn Header="Next Hop" Binding="{Binding NextHop}" Width="120"/>
+                        <DataGridTextColumn Header="Protocol" Binding="{Binding Protocol}" Width="100"/>
+                        <DataGridTextColumn Header="Metric" Binding="{Binding Metric}" Width="60"/>
+                        <DataGridTextColumn Header="Admin Distance" Binding="{Binding AdminDistance}" Width="100"/>
+                        <DataGridTextColumn Header="VRF" Binding="{Binding VRF}" Width="80"/>
+                        <DataGridTextColumn Header="Source" Binding="{Binding Source}" Width="100"/>
+                    </DataGrid.Columns>
+                </DataGrid>
+            </Grid>
+        </Border>
+
+        <!-- Add Manual Route Controls -->
+        <GroupBox Grid.Row="2" Header="Add Manual Route" Margin="5" Padding="10">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <!-- First row -->
+                <Label Grid.Row="0" Grid.Column="0" Content="Destination:" VerticalAlignment="Center" Margin="0,0,5,5"/>
+                <TextBox Grid.Row="0" Grid.Column="1" Name="DestBox" Text="0.0.0.0" Margin="0,0,10,5" VerticalContentAlignment="Center"/>
+
+                <Label Grid.Row="0" Grid.Column="2" Content="Mask:" VerticalAlignment="Center" Margin="0,0,5,5"/>
+                <TextBox Grid.Row="0" Grid.Column="3" Name="MaskBox" Text="0.0.0.0" Margin="0,0,10,5" VerticalContentAlignment="Center"/>
+
+                <Label Grid.Row="0" Grid.Column="4" Content="Next Hop:" VerticalAlignment="Center" Margin="0,0,5,5"/>
+                <TextBox Grid.Row="0" Grid.Column="5" Name="NextHopBox" Text="10.0.0.1" Margin="0,0,10,5" VerticalContentAlignment="Center"/>
+
+                <!-- Second row -->
+                <Label Grid.Row="1" Grid.Column="0" Content="Metric:" VerticalAlignment="Center" Margin="0,0,5,0"/>
+                <TextBox Grid.Row="1" Grid.Column="1" Name="MetricBox" Text="0" Margin="0,0,10,0" VerticalContentAlignment="Center"/>
+
+                <Label Grid.Row="1" Grid.Column="2" Content="VRF:" VerticalAlignment="Center" Margin="0,0,5,0"/>
+                <TextBox Grid.Row="1" Grid.Column="3" Name="VRFBox" Text="global" Margin="0,0,10,0" VerticalContentAlignment="Center"/>
+
+                <Button Grid.Row="1" Grid.Column="4" Grid.ColumnSpan="2" Name="AddRouteButton" Content="Add Route" Width="120" Margin="5,0,10,0" Padding="5"/>
+                <Button Grid.Row="1" Grid.Column="6" Name="DeleteSelectedButton" Content="Delete Selected" Width="120" Margin="0,0,0,0" Padding="5"/>
+            </Grid>
+        </GroupBox>
+    </Grid>
+</Window>
+"@
+
+    # Load XAML
+    $reader = New-Object System.Xml.XmlNodeReader $xaml
+    $dialog = [Windows.Markup.XamlReader]::Load($reader)
+    $dialog.Owner = $ParentWindow
+
+    # Get controls
+    $deviceCombo = $dialog.FindName("DeviceCombo")
+    $routesDataGrid = $dialog.FindName("RoutesDataGrid")
+    $destBox = $dialog.FindName("DestBox")
+    $maskBox = $dialog.FindName("MaskBox")
+    $nextHopBox = $dialog.FindName("NextHopBox")
+    $metricBox = $dialog.FindName("MetricBox")
+    $vrfBox = $dialog.FindName("VRFBox")
+    $addRouteButton = $dialog.FindName("AddRouteButton")
+    $deleteSelectedButton = $dialog.FindName("DeleteSelectedButton")
+
+    # Populate device combo
+    foreach ($device in $Devices) {
+        [void]$deviceCombo.Items.Add($device.Hostname)
+    }
+
+    # Function to refresh routing table display
+    function Refresh-RoutingTableDisplay {
+        if (-not $deviceCombo.SelectedItem) {
+            $routesDataGrid.ItemsSource = $null
+            return
+        }
+
+        $selectedDevice = $Devices | Where-Object { $_.Hostname -eq $deviceCombo.SelectedItem }
+        if (-not $selectedDevice) { return }
+
+        # Build complete routing table for display
+        $displayRoutes = @()
+
+        # Add manual routes (highest priority)
+        foreach ($route in $selectedDevice.ManualRoutes) {
+            $displayRoutes += [PSCustomObject]@{
+                Destination = $route.Destination
+                Mask = $route.Mask
+                NextHop = $route.NextHop
+                Protocol = "Manual"
+                Metric = $route.Metric
+                AdminDistance = 0
+                VRF = $route.VRF
+                Source = "Manual"
+            }
+        }
+
+        # Add parsed routes from config
+        foreach ($route in $selectedDevice.Routes) {
+            $displayRoutes += [PSCustomObject]@{
+                Destination = $route.Destination
+                Mask = $route.Mask
+                NextHop = $route.NextHop
+                Protocol = $route.Protocol
+                Metric = $route.Metric
+                AdminDistance = $route.AdminDistance
+                VRF = $route.VRF
+                Source = "Config"
+            }
+        }
+
+        # Add connected routes
+        foreach ($ifaceName in $selectedDevice.Interfaces.Keys) {
+            $iface = $selectedDevice.Interfaces[$ifaceName]
+            if ($iface.IPAddress -and $iface.Network -and $iface.Status -eq "up") {
+                $displayRoutes += [PSCustomObject]@{
+                    Destination = $iface.Network
+                    Mask = $iface.SubnetMask
+                    NextHop = "0.0.0.0"
+                    Protocol = "Connected"
+                    Metric = 0
+                    AdminDistance = 0
+                    VRF = $iface.VRF
+                    Source = "Connected"
+                }
+            }
+        }
+
+        # Sort by destination
+        $displayRoutes = $displayRoutes | Sort-Object -Property Destination,VRF
+        $routesDataGrid.ItemsSource = $displayRoutes
+    }
+
+    # Device selection changed event
+    $deviceCombo.Add_SelectionChanged({
+        Refresh-RoutingTableDisplay
+    })
+
+    # Add route button click event
+    $addRouteButton.Add_Click({
+        if (-not $deviceCombo.SelectedItem) {
+            [System.Windows.MessageBox]::Show("Please select a device first.", "Device Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+            return
+        }
+
+        $selectedDevice = $Devices | Where-Object { $_.Hostname -eq $deviceCombo.SelectedItem }
+        if (-not $selectedDevice) { return }
+
+        # Validate inputs
+        $dest = $destBox.Text.Trim()
+        $mask = $maskBox.Text.Trim()
+        $nextHop = $nextHopBox.Text.Trim()
+        $metric = 0
+        $vrf = $vrfBox.Text.Trim()
+
+        if ([string]::IsNullOrWhiteSpace($dest) -or [string]::IsNullOrWhiteSpace($mask) -or [string]::IsNullOrWhiteSpace($nextHop)) {
+            [System.Windows.MessageBox]::Show("Please fill in all required fields (Destination, Mask, Next Hop).", "Validation Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+            return
+        }
+
+        # Try to parse metric
+        if (-not [int]::TryParse($metricBox.Text.Trim(), [ref]$metric)) {
+            [System.Windows.MessageBox]::Show("Metric must be a valid integer.", "Validation Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+            return
+        }
+
+        # Create new route
+        $newRoute = [Route]::new($dest, $mask, $nextHop)
+        $newRoute.Metric = $metric
+        $newRoute.VRF = if ([string]::IsNullOrWhiteSpace($vrf)) { "global" } else { $vrf }
+        $newRoute.Protocol = "Manual"
+        $newRoute.AdminDistance = 0
+
+        # Add to device's manual routes
+        [void]$selectedDevice.ManualRoutes.Add($newRoute)
+
+        # Refresh display
+        Refresh-RoutingTableDisplay
+
+        [System.Windows.MessageBox]::Show("Route added successfully!", "Success", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+    })
+
+    # Delete selected route button
+    $deleteSelectedButton.Add_Click({
+        if (-not $deviceCombo.SelectedItem) {
+            [System.Windows.MessageBox]::Show("Please select a device first.", "Device Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+            return
+        }
+
+        if (-not $routesDataGrid.SelectedItem) {
+            [System.Windows.MessageBox]::Show("Please select a route to delete.", "Route Required", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+            return
+        }
+
+        $selectedRoute = $routesDataGrid.SelectedItem
+        if ($selectedRoute.Source -ne "Manual") {
+            [System.Windows.MessageBox]::Show("Only manually added routes can be deleted.", "Cannot Delete", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+            return
+        }
+
+        $selectedDevice = $Devices | Where-Object { $_.Hostname -eq $deviceCombo.SelectedItem }
+        if (-not $selectedDevice) { return }
+
+        # Find and remove the route
+        $routeToRemove = $null
+        foreach ($route in $selectedDevice.ManualRoutes) {
+            if ($route.Destination -eq $selectedRoute.Destination -and
+                $route.Mask -eq $selectedRoute.Mask -and
+                $route.NextHop -eq $selectedRoute.NextHop -and
+                $route.VRF -eq $selectedRoute.VRF) {
+                $routeToRemove = $route
+                break
+            }
+        }
+
+        if ($routeToRemove) {
+            [void]$selectedDevice.ManualRoutes.Remove($routeToRemove)
+            Refresh-RoutingTableDisplay
+            [System.Windows.MessageBox]::Show("Route deleted successfully!", "Success", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+        }
+    })
+
+    # Show dialog
+    [void]$dialog.ShowDialog()
+}
+
 function Show-NetworkMap {
     param(
         [System.Collections.ArrayList]$Devices,
@@ -2202,6 +2491,7 @@ function Show-NetworkMap {
                 <ComboBox Name="DestCombo" Width="150" Margin="5,0,0,0"/>
                 <Button Name="TraceButton" Content="Trace Path" Width="100" Margin="20,0,5,0" Padding="5"/>
                 <Button Name="ClearButton" Content="Clear" Width="80" Margin="5,0,0,0" Padding="5"/>
+                <Button Name="ManageRoutesButton" Content="Manage Routes" Width="110" Margin="5,0,0,0" Padding="5"/>
             </StackPanel>
             <!-- Second row: Source interface/IP specification -->
             <StackPanel Orientation="Horizontal" Margin="0,0,0,5">
@@ -2225,6 +2515,7 @@ function Show-NetworkMap {
                 <Button Name="ZoomOutButton" Content="-" Width="30" Margin="2,0,2,0" Padding="5" FontWeight="Bold"/>
                 <Button Name="ZoomResetButton" Content="Reset" Width="50" Margin="2,0,5,0" Padding="5"/>
                 <Label Name="ZoomLabel" Content="100%" VerticalAlignment="Center" Width="50" Margin="5,0,0,0"/>
+                <CheckBox Name="FilterPathDevicesCheckBox" Content="Show only path devices" VerticalAlignment="Center" Margin="20,0,0,0" IsChecked="False"/>
                 <Label Content="(Use mouse wheel or drag to pan)" VerticalAlignment="Center" Margin="20,0,0,0" Foreground="Gray" FontStyle="Italic"/>
             </StackPanel>
         </StackPanel>
@@ -2280,6 +2571,8 @@ function Show-NetworkMap {
     $useRoutingCheckBox = $window.FindName("UseRoutingCheckBox")
     $traceButton = $window.FindName("TraceButton")
     $clearButton = $window.FindName("ClearButton")
+    $manageRoutesButton = $window.FindName("ManageRoutesButton")
+    $filterPathDevicesCheckBox = $window.FindName("FilterPathDevicesCheckBox")
     $detailsBox = $window.FindName("DetailsBox")
     $zoomInButton = $window.FindName("ZoomInButton")
     $zoomOutButton = $window.FindName("ZoomOutButton")
@@ -3066,6 +3359,30 @@ function Show-NetworkMap {
 
             $detailsBox.Text = $details
 
+            # Apply device filter if checkbox is checked
+            if ($filterPathDevicesCheckBox.IsChecked) {
+                # Hide all devices not in path
+                foreach ($deviceName in $script:deviceElements.Keys) {
+                    if (-not $script:highlightedDevices.ContainsKey($deviceName)) {
+                        $script:deviceElements[$deviceName].Ellipse.Visibility = [System.Windows.Visibility]::Collapsed
+                        $script:deviceElements[$deviceName].Label.Visibility = [System.Windows.Visibility]::Collapsed
+                        $script:deviceElements[$deviceName].TypeLabel.Visibility = [System.Windows.Visibility]::Collapsed
+                    }
+                }
+
+                # Hide connections not in path
+                foreach ($connKey in $script:connectionElements.Keys) {
+                    if (-not $script:highlightedConnections.ContainsKey($connKey)) {
+                        # Also check reverse connection
+                        $parts = $connKey -split '-'
+                        $reverseKey = "$($parts[1])-$($parts[0])"
+                        if (-not $script:highlightedConnections.ContainsKey($reverseKey)) {
+                            $script:connectionElements[$connKey].Visibility = [System.Windows.Visibility]::Collapsed
+                        }
+                    }
+                }
+            }
+
         } else {
             # CONNECTIVITY-BASED PATH FINDING - original BFS algorithm
             $path = Find-Path -Source $srcDevice -Destination $dstDevice -AllDevices $Devices -Connections $Connections
@@ -3168,6 +3485,30 @@ function Show-NetworkMap {
             if ($qosCount -gt 0) { $details += "  QoS Policies: $qosCount`n" }
 
             $detailsBox.Text = $details
+
+            # Apply device filter if checkbox is checked
+            if ($filterPathDevicesCheckBox.IsChecked) {
+                # Hide all devices not in path
+                foreach ($deviceName in $script:deviceElements.Keys) {
+                    if (-not $script:highlightedDevices.ContainsKey($deviceName)) {
+                        $script:deviceElements[$deviceName].Ellipse.Visibility = [System.Windows.Visibility]::Collapsed
+                        $script:deviceElements[$deviceName].Label.Visibility = [System.Windows.Visibility]::Collapsed
+                        $script:deviceElements[$deviceName].TypeLabel.Visibility = [System.Windows.Visibility]::Collapsed
+                    }
+                }
+
+                # Hide connections not in path
+                foreach ($connKey in $script:connectionElements.Keys) {
+                    if (-not $script:highlightedConnections.ContainsKey($connKey)) {
+                        # Also check reverse connection
+                        $parts = $connKey -split '-'
+                        $reverseKey = "$($parts[1])-$($parts[0])"
+                        if (-not $script:highlightedConnections.ContainsKey($reverseKey)) {
+                            $script:connectionElements[$connKey].Visibility = [System.Windows.Visibility]::Collapsed
+                        }
+                    }
+                }
+            }
         }
     })
     
@@ -3184,8 +3525,63 @@ function Show-NetworkMap {
         $sourceIPBox.Text = "10.10.10.100"  # Reset to default
         $destIPBox.Text = "10.20.20.100"    # Reset to default
         $useRoutingCheckBox.IsChecked = $true  # Reset to default
+        $filterPathDevicesCheckBox.IsChecked = $false  # Reset filter
+
+        # Show all devices again
+        foreach ($devElements in $script:deviceElements.Values) {
+            $devElements.Ellipse.Visibility = [System.Windows.Visibility]::Visible
+            $devElements.Label.Visibility = [System.Windows.Visibility]::Visible
+            $devElements.TypeLabel.Visibility = [System.Windows.Visibility]::Visible
+        }
+        foreach ($line in $script:connectionElements.Values) {
+            $line.Visibility = [System.Windows.Visibility]::Visible
+        }
     })
-    
+
+    # Manage Routes button handler
+    $manageRoutesButton.Add_Click({
+        Show-RoutingTableDialog -Devices $Devices -ParentWindow $window
+    })
+
+    # Filter path devices checkbox handler
+    $filterPathDevicesCheckBox.Add_Checked({
+        # When checked, hide all devices that are not in the current path
+        if ($script:highlightedDevices.Count -gt 0) {
+            # Hide all devices not in path
+            foreach ($deviceName in $script:deviceElements.Keys) {
+                if (-not $script:highlightedDevices.ContainsKey($deviceName)) {
+                    $script:deviceElements[$deviceName].Ellipse.Visibility = [System.Windows.Visibility]::Collapsed
+                    $script:deviceElements[$deviceName].Label.Visibility = [System.Windows.Visibility]::Collapsed
+                    $script:deviceElements[$deviceName].TypeLabel.Visibility = [System.Windows.Visibility]::Collapsed
+                }
+            }
+
+            # Hide connections not in path
+            foreach ($connKey in $script:connectionElements.Keys) {
+                if (-not $script:highlightedConnections.ContainsKey($connKey)) {
+                    # Also check reverse connection
+                    $parts = $connKey -split '-'
+                    $reverseKey = "$($parts[1])-$($parts[0])"
+                    if (-not $script:highlightedConnections.ContainsKey($reverseKey)) {
+                        $script:connectionElements[$connKey].Visibility = [System.Windows.Visibility]::Collapsed
+                    }
+                }
+            }
+        }
+    })
+
+    $filterPathDevicesCheckBox.Add_Unchecked({
+        # Show all devices again
+        foreach ($devElements in $script:deviceElements.Values) {
+            $devElements.Ellipse.Visibility = [System.Windows.Visibility]::Visible
+            $devElements.Label.Visibility = [System.Windows.Visibility]::Visible
+            $devElements.TypeLabel.Visibility = [System.Windows.Visibility]::Visible
+        }
+        foreach ($line in $script:connectionElements.Values) {
+            $line.Visibility = [System.Windows.Visibility]::Visible
+        }
+    })
+
     # Show window
     [void]$window.ShowDialog()
 }
