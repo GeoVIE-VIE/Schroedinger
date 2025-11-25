@@ -1995,7 +1995,85 @@ function Find-RoutingPath {
             break
         }
 
-        # Build routing table for current device
+        # Special handling for External-WAN devices (stubs without full routing tables)
+        if ($currentDevice.DeviceType -eq "External-WAN") {
+            # WAN stub devices pass traffic through - find the exit interface that leads away from where we came
+            $exitInterface = $null
+            $nextHopIP = $null
+
+            # Find all interfaces that aren't the entry interface
+            foreach ($iface in $currentDevice.Interfaces.Values) {
+                if ($iface.Name -ne $pathHop.EntryInterface) {
+                    $exitInterface = $iface
+                    $nextHopIP = "WAN-Forwarded"  # Placeholder - WAN handles routing
+                    $pathHop.Reason = "Traffic forwarded through WAN provider (assumed proper routing)"
+                    break
+                }
+            }
+
+            # If only one interface (typical for WAN stubs), find any connected device
+            if (-not $exitInterface -and $currentDevice.Interfaces.Count -gt 0) {
+                $exitInterface = $currentDevice.Interfaces.Values | Select-Object -First 1
+                $nextHopIP = "WAN-Forwarded"
+                $pathHop.Reason = "Traffic forwarded through WAN provider (assumed proper routing)"
+            }
+
+            if (-not $exitInterface) {
+                $pathHop.Reason = "WAN device has no exit interface"
+                $pathHop.Error = $true
+                $path += $pathHop
+                break
+            }
+
+            $pathHop.ExitInterface = $exitInterface.Name
+            $pathHop.ExitIP = $exitInterface.IPAddress
+            $pathHop.ExitVRF = if ($exitInterface.VRF) { $exitInterface.VRF } else { "global" }
+            $pathHop.NextHop = "WAN-Network"
+            $path += $pathHop
+
+            # Store exit interface for next hop's entry interface tracking
+            $previousExitInterface = $exitInterface.Name
+
+            # Find next device via connection - prefer devices that aren't the previous hop
+            $nextDevice = $null
+            foreach ($conn in $Connections) {
+                if ($conn.Device1.Hostname -eq $currentDevice.Hostname -and $conn.Interface1 -eq $exitInterface.Name) {
+                    # Skip if this is going back to where we came from
+                    if ($path.Count -gt 1 -and $conn.Device2.Hostname -eq $path[$path.Count - 1].Device.Hostname) {
+                        continue
+                    }
+                    $nextDevice = $conn.Device2
+                    break
+                }
+                elseif ($conn.Device2.Hostname -eq $currentDevice.Hostname -and $conn.Interface2 -eq $exitInterface.Name) {
+                    # Skip if this is going back to where we came from
+                    if ($path.Count -gt 1 -and $conn.Device1.Hostname -eq $path[$path.Count - 1].Device.Hostname) {
+                        continue
+                    }
+                    $nextDevice = $conn.Device1
+                    break
+                }
+            }
+
+            if (-not $nextDevice) {
+                $pathHop.Reason += " | No next device found from WAN"
+                $pathHop.Error = $true
+                break
+            }
+
+            # Loop detection
+            if ($visitedDevices.ContainsKey($nextDevice.Hostname)) {
+                $pathHop.Reason += " | ROUTING LOOP DETECTED"
+                $pathHop.Error = $true
+                break
+            }
+
+            $visitedDevices[$nextDevice.Hostname] = $true
+            $currentDevice = $nextDevice
+            continue
+        }
+
+        # Build routing table for current device (normal devices, not WAN stubs)
         # Need to determine VRF - use first interface's VRF or global
         $deviceVRF = "global"
         if ($currentDevice.Interfaces.Count -gt 0) {
