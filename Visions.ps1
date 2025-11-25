@@ -2570,6 +2570,8 @@ function Show-NetworkMap {
                 <Button Name="TraceButton" Content="Trace Path" Width="100" Margin="20,0,5,0" Padding="5"/>
                 <Button Name="ClearButton" Content="Clear" Width="80" Margin="5,0,0,0" Padding="5"/>
                 <Button Name="ManageRoutesButton" Content="Manage Routes" Width="110" Margin="5,0,0,0" Padding="5"/>
+                <Label Content="Search:" VerticalAlignment="Center" Margin="20,0,0,0" Width="50"/>
+                <TextBox Name="SearchBox" Width="120" Margin="5,0,0,0" VerticalContentAlignment="Center"/>
             </StackPanel>
             <!-- Second row: Source interface/IP specification -->
             <StackPanel Orientation="Horizontal" Margin="0,0,0,5">
@@ -2651,6 +2653,7 @@ function Show-NetworkMap {
     $clearButton = $window.FindName("ClearButton")
     $manageRoutesButton = $window.FindName("ManageRoutesButton")
     $filterPathDevicesCheckBox = $window.FindName("FilterPathDevicesCheckBox")
+    $searchBox = $window.FindName("SearchBox")
     $detailsBox = $window.FindName("DetailsBox")
     $zoomInButton = $window.FindName("ZoomInButton")
     $zoomOutButton = $window.FindName("ZoomOutButton")
@@ -3434,6 +3437,12 @@ function Show-NetworkMap {
             $details += "  Security Checks:      $aclChecked interface(s) checked`n"
             $details += "`n"
             $details += "=" * 80 + "`n"
+            $details += "PATH SUMMARY`n"
+            $details += "=" * 80 + "`n"
+            $details += "Complete path: $($path -join ' -> ')`n"
+            $details += "Total hops: $($path.Count)`n"
+            $details += "Devices in path: $($script:highlightedDevices.Keys -join ', ')`n"
+            $details += "=" * 80 + "`n"
 
             $detailsBox.Text = $details
 
@@ -3612,6 +3621,7 @@ function Show-NetworkMap {
         $destIPBox.Text = "10.20.20.100"    # Reset to default
         $useRoutingCheckBox.IsChecked = $true  # Reset to default
         $filterPathDevicesCheckBox.IsChecked = $false  # Reset filter
+        $searchBox.Text = ""  # Clear search
 
         # Show all devices again
         foreach ($devElements in $script:deviceElements.Values) {
@@ -3661,14 +3671,65 @@ function Show-NetworkMap {
     })
 
     $filterPathDevicesCheckBox.Add_Unchecked({
-        # Show all devices again
-        foreach ($devElements in $script:deviceElements.Values) {
-            $devElements.Ellipse.Visibility = [System.Windows.Visibility]::Visible
-            $devElements.Label.Visibility = [System.Windows.Visibility]::Visible
-            $devElements.TypeLabel.Visibility = [System.Windows.Visibility]::Visible
+        # Show all devices again (unless search filter is active)
+        $searchText = $searchBox.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($searchText)) {
+            foreach ($devElements in $script:deviceElements.Values) {
+                $devElements.Ellipse.Visibility = [System.Windows.Visibility]::Visible
+                $devElements.Label.Visibility = [System.Windows.Visibility]::Visible
+                $devElements.TypeLabel.Visibility = [System.Windows.Visibility]::Visible
+            }
+            foreach ($line in $script:connectionElements.Values) {
+                $line.Visibility = [System.Windows.Visibility]::Visible
+            }
         }
-        foreach ($line in $script:connectionElements.Values) {
-            $line.Visibility = [System.Windows.Visibility]::Visible
+    })
+
+    # Search box event handler
+    $searchBox.Add_TextChanged({
+        $searchText = $searchBox.Text.Trim()
+
+        if ([string]::IsNullOrWhiteSpace($searchText)) {
+            # Show all devices if search is empty
+            foreach ($devElements in $script:deviceElements.Values) {
+                $devElements.Ellipse.Visibility = [System.Windows.Visibility]::Visible
+                $devElements.Label.Visibility = [System.Windows.Visibility]::Visible
+                $devElements.TypeLabel.Visibility = [System.Windows.Visibility]::Visible
+            }
+            # Also filter connections
+            foreach ($line in $script:connectionElements.Values) {
+                $line.Visibility = [System.Windows.Visibility]::Visible
+            }
+        } else {
+            # Hide devices that don't match search
+            $matchedDevices = @{}
+            foreach ($deviceName in $script:deviceElements.Keys) {
+                $matches = $deviceName -like "*$searchText*"
+                if ($matches) {
+                    $script:deviceElements[$deviceName].Ellipse.Visibility = [System.Windows.Visibility]::Visible
+                    $script:deviceElements[$deviceName].Label.Visibility = [System.Windows.Visibility]::Visible
+                    $script:deviceElements[$deviceName].TypeLabel.Visibility = [System.Windows.Visibility]::Visible
+                    $matchedDevices[$deviceName] = $true
+                } else {
+                    $script:deviceElements[$deviceName].Ellipse.Visibility = [System.Windows.Visibility]::Collapsed
+                    $script:deviceElements[$deviceName].Label.Visibility = [System.Windows.Visibility]::Collapsed
+                    $script:deviceElements[$deviceName].TypeLabel.Visibility = [System.Windows.Visibility]::Collapsed
+                }
+            }
+
+            # Show connections only between matched devices
+            foreach ($connKey in $script:connectionElements.Keys) {
+                $parts = $connKey -split '-'
+                if ($parts.Count -eq 2) {
+                    $dev1 = $parts[0]
+                    $dev2 = $parts[1]
+                    if ($matchedDevices.ContainsKey($dev1) -and $matchedDevices.ContainsKey($dev2)) {
+                        $script:connectionElements[$connKey].Visibility = [System.Windows.Visibility]::Visible
+                    } else {
+                        $script:connectionElements[$connKey].Visibility = [System.Windows.Visibility]::Collapsed
+                    }
+                }
+            }
         }
     })
 
