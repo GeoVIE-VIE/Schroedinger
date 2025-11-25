@@ -3437,8 +3437,8 @@ function Show-NetworkMap {
 
             $detailsBox.Text = $details
 
-            # Apply device filter if checkbox is checked
-            if ($filterPathDevicesCheckBox.IsChecked) {
+            # Apply device filter if checkbox is checked (only if path has multiple hops)
+            if ($filterPathDevicesCheckBox.IsChecked -and $script:highlightedDevices.Count -gt 1) {
                 # Hide all devices not in path
                 foreach ($deviceName in $script:deviceElements.Keys) {
                     if (-not $script:highlightedDevices.ContainsKey($deviceName)) {
@@ -3459,6 +3459,10 @@ function Show-NetworkMap {
                         }
                     }
                 }
+            } elseif ($filterPathDevicesCheckBox.IsChecked -and $script:highlightedDevices.Count -le 1) {
+                # Path trace didn't complete - show warning
+                [System.Windows.MessageBox]::Show("Please complete a successful path trace before filtering devices.`n`nCurrent path has $($script:highlightedDevices.Count) device(s). Need at least 2 for filtering.", "No Path Traced", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+                $filterPathDevicesCheckBox.IsChecked = $false
             }
 
         } else {
@@ -3564,8 +3568,8 @@ function Show-NetworkMap {
 
             $detailsBox.Text = $details
 
-            # Apply device filter if checkbox is checked
-            if ($filterPathDevicesCheckBox.IsChecked) {
+            # Apply device filter if checkbox is checked (only if path has multiple hops)
+            if ($filterPathDevicesCheckBox.IsChecked -and $script:highlightedDevices.Count -gt 1) {
                 # Hide all devices not in path
                 foreach ($deviceName in $script:deviceElements.Keys) {
                     if (-not $script:highlightedDevices.ContainsKey($deviceName)) {
@@ -3586,6 +3590,10 @@ function Show-NetworkMap {
                         }
                     }
                 }
+            } elseif ($filterPathDevicesCheckBox.IsChecked -and $script:highlightedDevices.Count -le 1) {
+                # Path trace didn't complete - show warning
+                [System.Windows.MessageBox]::Show("Please complete a successful path trace before filtering devices.`n`nCurrent path has $($script:highlightedDevices.Count) device(s). Need at least 2 for filtering.", "No Path Traced", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+                $filterPathDevicesCheckBox.IsChecked = $false
             }
         }
     })
@@ -3624,7 +3632,7 @@ function Show-NetworkMap {
     # Filter path devices checkbox handler
     $filterPathDevicesCheckBox.Add_Checked({
         # When checked, hide all devices that are not in the current path
-        if ($script:highlightedDevices.Count -gt 0) {
+        if ($script:highlightedDevices.Count -gt 1) {
             # Hide all devices not in path
             foreach ($deviceName in $script:deviceElements.Keys) {
                 if (-not $script:highlightedDevices.ContainsKey($deviceName)) {
@@ -3645,6 +3653,10 @@ function Show-NetworkMap {
                     }
                 }
             }
+        } else {
+            # Not enough devices in path - uncheck and warn
+            [System.Windows.MessageBox]::Show("Please complete a successful path trace before filtering devices.`n`nCurrent path has $($script:highlightedDevices.Count) device(s). Need at least 2 for filtering.", "No Path Traced", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+            $filterPathDevicesCheckBox.IsChecked = $false
         }
     })
 
