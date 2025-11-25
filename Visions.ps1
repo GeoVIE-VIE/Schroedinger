@@ -2550,7 +2550,7 @@ function Show-NetworkMap {
 <Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="Network Path Tracer" Height="700" Width="1000"
+    Title="Network Path Tracer" Height="700" Width="1200"
     WindowStartupLocation="CenterScreen">
     <Grid>
         <Grid.RowDefinitions>
@@ -3621,7 +3621,7 @@ function Show-NetworkMap {
         $destIPBox.Text = "10.20.20.100"    # Reset to default
         $useRoutingCheckBox.IsChecked = $true  # Reset to default
         $filterPathDevicesCheckBox.IsChecked = $false  # Reset filter
-        $searchBox.Text = ""  # Clear search
+        if ($searchBox) { $searchBox.Text = "" }  # Clear search
 
         # Show all devices again
         foreach ($devElements in $script:deviceElements.Values) {
@@ -3672,7 +3672,7 @@ function Show-NetworkMap {
 
     $filterPathDevicesCheckBox.Add_Unchecked({
         # Show all devices again (unless search filter is active)
-        $searchText = $searchBox.Text.Trim()
+        $searchText = if ($searchBox) { $searchBox.Text.Trim() } else { "" }
         if ([string]::IsNullOrWhiteSpace($searchText)) {
             foreach ($devElements in $script:deviceElements.Values) {
                 $devElements.Ellipse.Visibility = [System.Windows.Visibility]::Visible
@@ -3686,52 +3686,54 @@ function Show-NetworkMap {
     })
 
     # Search box event handler
-    $searchBox.Add_TextChanged({
-        $searchText = $searchBox.Text.Trim()
+    if ($searchBox) {
+        $searchBox.Add_TextChanged({
+            $searchText = $searchBox.Text.Trim()
 
-        if ([string]::IsNullOrWhiteSpace($searchText)) {
-            # Show all devices if search is empty
-            foreach ($devElements in $script:deviceElements.Values) {
-                $devElements.Ellipse.Visibility = [System.Windows.Visibility]::Visible
-                $devElements.Label.Visibility = [System.Windows.Visibility]::Visible
-                $devElements.TypeLabel.Visibility = [System.Windows.Visibility]::Visible
-            }
-            # Also filter connections
-            foreach ($line in $script:connectionElements.Values) {
-                $line.Visibility = [System.Windows.Visibility]::Visible
-            }
-        } else {
-            # Hide devices that don't match search
-            $matchedDevices = @{}
-            foreach ($deviceName in $script:deviceElements.Keys) {
-                $matches = $deviceName -like "*$searchText*"
-                if ($matches) {
-                    $script:deviceElements[$deviceName].Ellipse.Visibility = [System.Windows.Visibility]::Visible
-                    $script:deviceElements[$deviceName].Label.Visibility = [System.Windows.Visibility]::Visible
-                    $script:deviceElements[$deviceName].TypeLabel.Visibility = [System.Windows.Visibility]::Visible
-                    $matchedDevices[$deviceName] = $true
-                } else {
-                    $script:deviceElements[$deviceName].Ellipse.Visibility = [System.Windows.Visibility]::Collapsed
-                    $script:deviceElements[$deviceName].Label.Visibility = [System.Windows.Visibility]::Collapsed
-                    $script:deviceElements[$deviceName].TypeLabel.Visibility = [System.Windows.Visibility]::Collapsed
+            if ([string]::IsNullOrWhiteSpace($searchText)) {
+                # Show all devices if search is empty
+                foreach ($devElements in $script:deviceElements.Values) {
+                    $devElements.Ellipse.Visibility = [System.Windows.Visibility]::Visible
+                    $devElements.Label.Visibility = [System.Windows.Visibility]::Visible
+                    $devElements.TypeLabel.Visibility = [System.Windows.Visibility]::Visible
                 }
-            }
-
-            # Show connections only between matched devices
-            foreach ($connKey in $script:connectionElements.Keys) {
-                $parts = $connKey -split '-'
-                if ($parts.Count -eq 2) {
-                    $dev1 = $parts[0]
-                    $dev2 = $parts[1]
-                    if ($matchedDevices.ContainsKey($dev1) -and $matchedDevices.ContainsKey($dev2)) {
-                        $script:connectionElements[$connKey].Visibility = [System.Windows.Visibility]::Visible
+                # Also filter connections
+                foreach ($line in $script:connectionElements.Values) {
+                    $line.Visibility = [System.Windows.Visibility]::Visible
+                }
+            } else {
+                # Hide devices that don't match search
+                $matchedDevices = @{}
+                foreach ($deviceName in $script:deviceElements.Keys) {
+                    $matches = $deviceName -like "*$searchText*"
+                    if ($matches) {
+                        $script:deviceElements[$deviceName].Ellipse.Visibility = [System.Windows.Visibility]::Visible
+                        $script:deviceElements[$deviceName].Label.Visibility = [System.Windows.Visibility]::Visible
+                        $script:deviceElements[$deviceName].TypeLabel.Visibility = [System.Windows.Visibility]::Visible
+                        $matchedDevices[$deviceName] = $true
                     } else {
-                        $script:connectionElements[$connKey].Visibility = [System.Windows.Visibility]::Collapsed
+                        $script:deviceElements[$deviceName].Ellipse.Visibility = [System.Windows.Visibility]::Collapsed
+                        $script:deviceElements[$deviceName].Label.Visibility = [System.Windows.Visibility]::Collapsed
+                        $script:deviceElements[$deviceName].TypeLabel.Visibility = [System.Windows.Visibility]::Collapsed
+                    }
+                }
+
+                # Show connections only between matched devices
+                foreach ($connKey in $script:connectionElements.Keys) {
+                    $parts = $connKey -split '-'
+                    if ($parts.Count -eq 2) {
+                        $dev1 = $parts[0]
+                        $dev2 = $parts[1]
+                        if ($matchedDevices.ContainsKey($dev1) -and $matchedDevices.ContainsKey($dev2)) {
+                            $script:connectionElements[$connKey].Visibility = [System.Windows.Visibility]::Visible
+                        } else {
+                            $script:connectionElements[$connKey].Visibility = [System.Windows.Visibility]::Collapsed
+                        }
                     }
                 }
             }
-        }
-    })
+        })
+    }
 
     # Show window
     [void]$window.ShowDialog()
